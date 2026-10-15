@@ -194,7 +194,9 @@ def apply_workspace_pause(
             "items": [
                 {"key": "accessKeyId", "path": "accessKeyId"},
                 {"key": "secretAccessKey", "path": "secretAccessKey"},
-                {"key": "sessionToken", "path": "sessionToken"},
+                # sessionToken is optional: static AK/SK Secrets do not carry
+                # one, and a required projection would fail the whole mount.
+                {"key": "sessionToken", "path": "sessionToken", "optional": True},
             ],
         },
     }
