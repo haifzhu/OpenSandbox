@@ -228,6 +228,7 @@ max_attempts = 3
 - **后端矩阵 e2e**:MinIO(必测,path-style)、阿里云 OSS S3 兼容端点、AWS S3(虚拟主机风格)。
 - 性能:首同步 vs 增量(delta<100MB 时 pause 数据面 <5s);resume P99。
 - 混沌:同步中删 Pod、控制器重启、重复 pause/resume 摆动。
+- **生命周期不变量(必测)**:同一沙箱 ≥3 轮 [改数据→pause→resume],每轮校验注入的 `--generation` == MinIO LATEST 代,且恢复内容 == 本轮写入值。Pod 模板跨周期持久,restore init 参数若只注入不刷新,会永久回放旧代——pause 侧全部用例仍会绿灯,故此不变量必须独立成例。
 
 ## 14. 分阶段交付
 

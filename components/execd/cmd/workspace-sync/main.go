@@ -169,6 +169,7 @@ func run(req syncRequest, timeout time.Duration) error {
 			Region:          req.Region,
 			ForcePathStyle:  req.ForcePathStyle,
 			CredsSecretName: req.CredsSecretName,
+			ManifestDigest:  syncResp.Latest.ManifestDigest,
 			FilesTotal:      syncResp.Stats.FilesTotal,
 			FilesChanged:    syncResp.Stats.FilesChanged,
 			FilesDeleted:    syncResp.Stats.FilesDeleted,

@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -131,14 +132,25 @@ func TestInjectWorkspaceRestore(t *testing.T) {
 		}
 	}
 
-	// Idempotent: injecting twice does not duplicate anything.
+	// Idempotent: injecting twice does not duplicate anything, and a snapshot
+	// from a NEW cycle must REPLACE the pinned generation (the template is
+	// persistent; a skip would replay stale generations forever).
 	volumesBefore := len(template.Spec.Volumes)
 	initsBefore := len(template.Spec.InitContainers)
+	snapshot.Status.Workspace.Generation = 42
 	if err := injectWorkspaceRestore(template, snapshot, "syncer:1"); err != nil {
 		t.Fatalf("second inject: %v", err)
 	}
 	if len(template.Spec.Volumes) != volumesBefore || len(template.Spec.InitContainers) != initsBefore {
-		t.Errorf("second injection was not idempotent")
+		t.Errorf("second injection duplicated containers or volumes")
+	}
+	for _, c := range template.Spec.InitContainers {
+		if c.Name == workspaceRestoreInitName {
+			joined := strings.Join(c.Args, " ")
+			if !strings.Contains(joined, "--generation 42") {
+				t.Errorf("existing restore init was not refreshed: %v", c.Args)
+			}
+		}
 	}
 }
 
@@ -196,4 +208,50 @@ func TestInjectWorkspaceRestoreCredsFallback(t *testing.T) {
 	if !found["OBJSYNC_ACCESS_KEY_ID"] || !found["OBJSYNC_SECRET_ACCESS_KEY"] {
 		t.Fatal("credentials fallback to snapshot status did not apply")
 	}
+}
+
+// TestInjectWorkspaceRestoreLifecycleAcrossCycles pins the full-flow
+// invariant the cluster bug exposed: the pod template PERSISTS across
+// pause/resume cycles, so the restore init injected in cycle 1 (pinned to
+// that cycle's generation) must be refreshed to the LATEST generation on
+// every subsequent resume — otherwise every resume replays stale data
+// forever while all pause-side checks stay green.
+func TestInjectWorkspaceRestoreLifecycleAcrossCycles(t *testing.T) {
+	template := baseTemplate()
+
+	// Cycle 1: pause commits generation 5, resume injects restore pinned to 5.
+	snapshot := s3WorkspaceSnapshot()
+	snapshot.Status.Workspace.Generation = 5
+	if err := injectWorkspaceRestore(template, snapshot, "syncer:1"); err != nil {
+		t.Fatalf("cycle 1 inject: %v", err)
+	}
+
+	// Cycle 2 and 3: data changed, pauses committed generations 6 then 7.
+	// The SAME template object (persisted on the BatchSandbox) is injected
+	// again on each resume.
+	for _, gen := range []uint64{6, 7} {
+		snapshot.Status.Workspace.Generation = gen
+		if err := injectWorkspaceRestore(template, snapshot, "syncer:1"); err != nil {
+			t.Fatalf("cycle gen=%d inject: %v", gen, err)
+		}
+		init := findRestoreInit(t, template)
+		joined := strings.Join(init.Args, " ")
+		if !strings.Contains(joined, fmt.Sprintf("--generation %d", gen)) {
+			t.Fatalf("resume must restore the LATEST generation %d, got args: %v", gen, init.Args)
+		}
+		if strings.Count(joined, "--generation") != 1 {
+			t.Fatalf("restore init duplicated: %v", template.Spec.InitContainers)
+		}
+	}
+}
+
+func findRestoreInit(t *testing.T, template *corev1.PodTemplateSpec) *corev1.Container {
+	t.Helper()
+	for i := range template.Spec.InitContainers {
+		if template.Spec.InitContainers[i].Name == workspaceRestoreInitName {
+			return &template.Spec.InitContainers[i]
+		}
+	}
+	t.Fatal("restore init container missing")
+	return nil
 }

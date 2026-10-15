@@ -67,12 +67,6 @@ func injectWorkspaceRestore(template *corev1.PodTemplateSpec, snapshot *sandboxv
 	roots := append([]string(nil), ws.Roots...)
 	sort.Strings(roots)
 
-	for _, c := range template.Spec.InitContainers {
-		if c.Name == workspaceRestoreInitName {
-			return nil // idempotent
-		}
-	}
-
 	main := &template.Spec.Containers[0]
 	var mounts []corev1.VolumeMount
 	for _, root := range roots {
@@ -111,8 +105,40 @@ func injectWorkspaceRestore(template *corev1.PodTemplateSpec, snapshot *sandboxv
 	if ws.ForcePathStyle {
 		restore.Args = append(restore.Args, "--path-style")
 	}
+
+	// The pod template is persistent across pause/resume cycles, so a restore
+	// init injected by a PREVIOUS cycle may already be there — pinned to that
+	// cycle's generation. Idempotency here means REPLACE-in-place with the
+	// current snapshot's values; skipping would replay stale generations
+	// forever (observed: every resume restored gen 1).
+	for i := range template.Spec.InitContainers {
+		if template.Spec.InitContainers[i].Name == workspaceRestoreInitName {
+			restore.VolumeMounts = mergeRestoreMounts(template.Spec.InitContainers[i].VolumeMounts, mounts)
+			template.Spec.InitContainers[i] = restore
+			return nil
+		}
+	}
 	template.Spec.InitContainers = append(template.Spec.InitContainers, restore)
 	return nil
+}
+
+// mergeRestoreMounts keeps any extra mounts the previous injection carried
+// (future-proof) while ensuring every sync root is mounted.
+func mergeRestoreMounts(existing, wanted []corev1.VolumeMount) []corev1.VolumeMount {
+	merged := append([]corev1.VolumeMount(nil), existing...)
+	for _, m := range wanted {
+		found := false
+		for _, x := range merged {
+			if x.MountPath == m.MountPath {
+				found = true
+				break
+			}
+		}
+		if !found {
+			merged = append(merged, m)
+		}
+	}
+	return merged
 }
 
 // workspaceVolumeName derives the workspace volume name from a mount path.
