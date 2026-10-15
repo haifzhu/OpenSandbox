@@ -132,6 +132,7 @@ spec:
                 enum:
                 - rootfs-v1
                 - qemu-v1
+                - s3-workspace-v1
                 type: string
               observedGeneration:
                 description: ObservedGeneration is the most recent spec generation
@@ -236,6 +237,66 @@ spec:
                 - manifestDigest
                 - payloadDigest
                 - sizeBytes
+                type: object
+              workspace:
+                description: |-
+                  Workspace contains the object-storage artifact result for
+                  s3-workspace-v1 snapshots. The base image is not replaced on resume;
+                  workspace paths are restored from this artifact by an init container.
+                properties:
+                  bytesUploaded:
+                    description: BytesUploaded is the delta bytes pushed by the committing
+                      sync.
+                    format: int64
+                    type: integer
+                  credentialsSecretName:
+                    description: |-
+                      CredentialsSecretName names the Secret used for deletion-time cleanup
+                      of the object prefix.
+                    type: string
+                  endpoint:
+                    description: Endpoint is the S3-compatible endpoint used at pause
+                      time.
+                    type: string
+                  filesTotal:
+                    description: FilesTotal is the number of entries in the committed
+                      manifest.
+                    type: integer
+                  forcePathStyle:
+                    description: ForcePathStyle records path-style addressing for
+                      resume.
+                    type: boolean
+                  generation:
+                    description: Generation is the committed generation in that namespace.
+                    format: int64
+                    minimum: 1
+                    type: integer
+                  manifestDigest:
+                    description: ManifestDigest identifies the committed manifest
+                      (sha256 hex).
+                    type: string
+                  region:
+                    description: Region is the S3 region used at pause time.
+                    type: string
+                  roots:
+                    description: Roots are the absolute container paths covered by
+                      the sync.
+                    items:
+                      type: string
+                    type: array
+                  syncSeconds:
+                    description: SyncSeconds is the wall-clock duration of the committing
+                      sync.
+                    format: int64
+                    type: integer
+                  target:
+                    description: Target is the canonical s3://bucket/prefix namespace
+                      synced.
+                    type: string
+                required:
+                - generation
+                - roots
+                - target
                 type: object
             type: object
         type: object

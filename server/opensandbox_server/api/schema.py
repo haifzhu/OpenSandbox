@@ -551,6 +551,88 @@ class SandboxStatus(BaseModel):
 # Sandbox Models
 # ============================================================================
 
+
+class PausePolicy(BaseModel):
+    """Pause persistence policy (s3-workspace provider).
+
+    Omitting ``pausePolicy`` keeps the default OCI rootfs-commit pause. With
+    ``S3Workspace``, pause syncs the listed paths incrementally to an
+    S3-compatible object store (OSS/MinIO/AWS S3) and releases the pod;
+    resume reuses the original base image plus a workspace-restore init
+    container. The image never grows.
+    """
+
+    provider: Literal["Rootfs", "S3Workspace"] = Field(
+        default="Rootfs",
+        description="Pause persistence backend; Rootfs is the default commit path.",
+    )
+    paths: Optional[List[str]] = Field(
+        None,
+        alias="paths",
+        description=(
+            "Absolute container paths to persist (default [/workspace] or the "
+            "deployment default). System-layer changes outside these paths are "
+            "not preserved."
+        ),
+    )
+    bucket: Optional[str] = Field(
+        None,
+        description="Object bucket override; must pass the deployment allowlist.",
+    )
+    prefix: Optional[str] = Field(
+        None,
+        description=(
+            "Key prefix override (tenant isolation); must pass the deployment "
+            "allowlist. All objects live under it."
+        ),
+    )
+    credentials_secret_name: Optional[str] = Field(
+        None,
+        alias="credentialsSecretName",
+        description=(
+            "K8s Secret with accessKeyId/secretAccessKey/sessionToken keys. "
+            "Falls back to the deployment default."
+        ),
+    )
+    exclude_patterns: Optional[List[str]] = Field(
+        None,
+        alias="excludePatterns",
+        description="doublestar exclude patterns matched relative to each path.",
+    )
+    retention_generations: Optional[int] = Field(
+        None,
+        alias="retentionGenerations",
+        ge=1,
+        le=100,
+        description="Committed generations kept per sandbox (cleanup is asynchronous).",
+    )
+
+    @model_validator(mode="after")
+    def validate_provider_fields(self) -> "PausePolicy":
+        if self.provider == "Rootfs":
+            overriden = [
+                name
+                for name, value in (
+                    ("paths", self.paths),
+                    ("bucket", self.bucket),
+                    ("prefix", self.prefix),
+                    ("credentialsSecretName", self.credentials_secret_name),
+                    ("excludePatterns", self.exclude_patterns),
+                    ("retentionGenerations", self.retention_generations),
+                )
+                if value is not None
+            ]
+            if overriden:
+                raise ValueError(
+                    f"pausePolicy fields {overriden} only apply to provider S3Workspace"
+                )
+        return self
+
+    class Config:
+        extra = "forbid"
+        populate_by_name = True
+
+
 class CreateSandboxRequest(BaseModel):
     """
     Request to create a new sandbox from either a container image or a snapshot.
@@ -568,6 +650,14 @@ class CreateSandboxRequest(BaseModel):
         None,
         alias="snapshotId",
         description="Snapshot identifier to restore from",
+    )
+    pause_policy: Optional[PausePolicy] = Field(
+        None,
+        alias="pausePolicy",
+        description=(
+            "Pause persistence policy. Omitted = default OCI rootfs commit; "
+            "S3Workspace = incremental object-store sync with a fixed base image."
+        ),
     )
     platform: Optional[PlatformSpec] = Field(
         None,

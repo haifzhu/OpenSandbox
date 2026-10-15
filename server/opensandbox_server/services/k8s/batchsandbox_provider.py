@@ -103,6 +103,7 @@ class BatchSandboxProvider(WorkloadProvider):
         app_config: Optional[AppConfig] = None,
     ):
         self.k8s_client = k8s_client
+        self.app_config = app_config
         self.ingress_config = app_config.ingress if app_config else None
 
         k8s_config = app_config.kubernetes if app_config else None
@@ -144,6 +145,7 @@ class BatchSandboxProvider(WorkloadProvider):
         platform: Optional[PlatformSpec] = None,
         annotations: Optional[Dict[str, str]] = None,
         resource_requests: Optional[Dict[str, str]] = None,
+        pause_policy: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Create a BatchSandbox in template mode or pool mode."""
         extensions = extensions or {}
@@ -270,6 +272,29 @@ class BatchSandboxProvider(WorkloadProvider):
 
         if volumes:
             apply_volumes_to_pod_spec(pod_spec, volumes)
+
+        annotations = dict(annotations or {})
+        if pause_policy is not None and getattr(pause_policy, "provider", "Rootfs") == "S3Workspace":
+            if windows_profile:
+                raise ValueError(
+                    "pausePolicy S3Workspace is not supported for Windows/VM sandboxes: "
+                    "the sync covers the pod-side filesystem, not the VM disk"
+                )
+            from opensandbox_server.services.k8s.workspace_pause import (
+                apply_workspace_pause,
+            )
+
+            apply_workspace_pause(
+                pod_spec=pod_spec,
+                annotations=annotations,
+                pause_policy=pause_policy,
+                app_config=self.app_config,
+                namespace=namespace,
+                sandbox_id=sandbox_id,
+                request_volume_mount_paths=[
+                    v.mountPath for v in (volumes or [])
+                ],
+            )
 
         spec: Dict[str, Any] = {
             "replicas": 1,
@@ -730,12 +755,76 @@ class BatchSandboxProvider(WorkloadProvider):
         else:
             raise ValueError(f"Cannot pause sandbox in phase {phase}")
 
+        # Circuit breaker for s3-workspace sandboxes: consecutive failed
+        # pauses are counted in a workload annotation and stop being retried
+        # after pause.s3.max_attempts (the controller itself never
+        # auto-retries; this bounds the server retry bridge). A successful
+        # resume clears the condition and the counter.
+        if self._is_s3_workspace(batchsandbox):
+            max_attempts = self._pause_max_attempts()
+            if max_attempts == 0:
+                pass  # breaker disabled ([pause.s3] max_attempts = 0)
+            elif pause_failed:
+                attempts = self._bump_pause_failure_count(batchsandbox)
+                if attempts > max_attempts:
+                    raise ValueError(
+                        f"Cannot pause: circuit breaker open after {max_attempts} "
+                        "consecutive failures; resume the sandbox to reset"
+                    )
+            else:
+                self._reset_pause_failure_count(batchsandbox)
+
         if pause_failed:
             self._patch_pause_with_retry_bridge(sandbox_id, namespace, True)
             logger.info(f"Patched BatchSandbox {sandbox_id} retry bridge spec.pause=nil->true")
         else:
             self.patch_workload(sandbox_id, namespace, {"spec": {"pause": True}})
             logger.info(f"Patched BatchSandbox {sandbox_id} spec.pause=true")
+
+    _PAUSE_FAILURE_COUNT_ANNOTATION = "opensandbox.io/pause-failure-count"
+
+    def _is_s3_workspace(self, batchsandbox: Dict[str, Any]) -> bool:
+        try:
+            annotations = batchsandbox["spec"]["template"]["metadata"]["annotations"] or {}
+        except (KeyError, TypeError):
+            return False
+        return (
+            annotations.get("sandbox.opensandbox.io/checkpoint-provider")
+            == "s3-workspace"
+        )
+
+    def _pause_max_attempts(self) -> int:
+        pause_cfg = getattr(self.app_config, "pause", None) if self.app_config else None
+        s3_cfg = getattr(pause_cfg, "s3", None) if pause_cfg else None
+        return int(getattr(s3_cfg, "max_attempts", 3) or 3)
+
+    def _bump_pause_failure_count(self, batchsandbox: Dict[str, Any]) -> int:
+        annotations = batchsandbox["metadata"].get("annotations", {}) or {}
+        count = int(annotations.get(self._PAUSE_FAILURE_COUNT_ANNOTATION, "0")) + 1
+        self.patch_workload(
+            batchsandbox["metadata"]["name"],
+            batchsandbox["metadata"].get("namespace", ""),
+            {
+                "metadata": {
+                    "annotations": {self._PAUSE_FAILURE_COUNT_ANNOTATION: str(count)}
+                }
+            },
+        )
+        return count
+
+    def _reset_pause_failure_count(self, batchsandbox: Dict[str, Any]) -> None:
+        annotations = batchsandbox["metadata"].get("annotations", {}) or {}
+        if self._PAUSE_FAILURE_COUNT_ANNOTATION not in annotations:
+            return
+        self.patch_workload(
+            batchsandbox["metadata"]["name"],
+            batchsandbox["metadata"].get("namespace", ""),
+            {
+                "metadata": {
+                    "annotations": {self._PAUSE_FAILURE_COUNT_ANNOTATION: None}
+                }
+            },
+        )
 
     def resume_sandbox(self, sandbox_id: str, namespace: str) -> None:
         """Resume a BatchSandbox by patching spec.pause=false.

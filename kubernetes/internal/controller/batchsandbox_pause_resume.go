@@ -603,7 +603,12 @@ func (r *BatchSandboxReconciler) continueResume(ctx context.Context, bs *sandbox
 					latest.Spec.Template.Spec.Containers[i].Image = img
 				}
 			}
-			if err := injectQEMURestore(latest.Spec.Template, snapshot); err != nil {
+			if snapshot.Status.Format == sandboxv1alpha1.SandboxSnapshotFormatQEMUV1 {
+				if err := injectQEMURestore(latest.Spec.Template, snapshot); err != nil {
+					return err
+				}
+			}
+			if err := injectWorkspaceRestore(latest.Spec.Template, snapshot, r.WorkspaceSyncImage); err != nil {
 				return err
 			}
 			ensureImagePullSecret(latest.Spec.Template, r.ResumePullSecret)

@@ -16,6 +16,7 @@ package web
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -32,11 +33,14 @@ import (
 //
 // /internal/init is an internal control-plane protocol: it is not part of
 // the public execd API surface and carries no external compatibility
-// guarantee.
+// guarantee. /internal/snapshot/sync follows the same trust model: it is
+// called only by the pause sync Job over the pod network and is protected by
+// pod-network isolation rather than the access token.
 var preInitPaths = map[string]struct{}{
-	"/ping":          {},
-	"/ready":         {},
-	"/internal/init": {},
+	"/ping":                   {},
+	"/ready":                  {},
+	"/internal/init":          {},
+	"/internal/snapshot/sync": {},
 }
 
 func NewRouter(accessToken string) *gin.Engine {
@@ -46,11 +50,25 @@ func NewRouter(accessToken string) *gin.Engine {
 	// The runtime-init gate runs before auth: pre-init business APIs answer
 	// a uniform 503 regardless of credentials, and the access-token check
 	// only sees requests that passed the gate.
-	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), runtimeInitGate(), accessTokenMiddleware(accessToken), ProxyMiddleware())
+	r.Use(logMiddleware(), otelHTTPMetricsMiddleware(), mutatingSyncGateMiddleware(), runtimeInitGate(), accessTokenMiddleware(accessToken), ProxyMiddleware())
 
 	r.GET("/ping", controller.PingHandler)
 	r.POST("/internal/init", withInit(func(c *controller.InitController) { c.Init() }))
 	r.GET("/ready", withInit(func(c *controller.InitController) { c.Ready() }))
+	r.POST("/internal/snapshot/sync", func(ctx *gin.Context) {
+		// Write-quiesce: drain in-flight mutating requests (bounded), then
+		// hold exclusive access for the whole sync so the manifest describes
+		// a stable tree; new mutating requests answer 503 meanwhile.
+		release, ok := beginWorkspaceSync(30 * time.Second)
+		if !ok {
+			ctx.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"error": "in-flight commands did not drain within 30s; sync aborted",
+			})
+			return
+		}
+		defer release()
+		controller.NewSnapshotController(ctx).SyncWorkspace()
+	})
 
 	registerFilesystemRoutes(r.Group(""))
 	registerFilesystemRoutes(r.Group("/v1/filesystem/:uid/:gid", filesystemIdentityMiddleware()))

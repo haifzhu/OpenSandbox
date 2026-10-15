@@ -48,8 +48,45 @@ type Request struct {
 	Provider          string            `json:"provider"`
 	Containers        []ContainerTarget `json:"containers"`
 	QEMU              *QEMURequest      `json:"qemu,omitempty"`
+	S3Workspace       *S3Request        `json:"s3Workspace,omitempty"`
 	VMStateImageURI   string            `json:"vmStateImageUri,omitempty"`
 	LeaveSourceFrozen bool              `json:"leaveSourceFrozen,omitempty"`
+}
+
+// S3Request drives an s3-workspace sync Job: it POSTs the sync request to
+// execd on the source pod and verifies the LATEST pointer afterwards.
+type S3Request struct {
+	Version         string   `json:"version"`
+	TargetURL       string   `json:"targetUrl"`             // s3://bucket/prefix/sandboxes/{ns}/{id}
+	SourcePodIP     string   `json:"sourcePodIp,omitempty"` // resolved by the controller
+	ExecDPort       int      `json:"execdPort"`             // execd API port on the source pod
+	Roots           []string `json:"roots"`                 // absolute container paths to sync
+	ExcludePatterns []string `json:"excludePatterns,omitempty"`
+	Endpoint        string   `json:"endpoint,omitempty"`
+	Region          string   `json:"region,omitempty"`
+	ForcePathStyle  bool     `json:"forcePathStyle,omitempty"`
+	// CredsSecretName is echoed into the result so deletion-time cleanup can
+	// project the same credentials.
+	CredsSecretName string `json:"credsSecretName,omitempty"`
+}
+
+// S3Result is the sync Job termination message for s3-workspace snapshots.
+type S3Result struct {
+	Generation     uint64   `json:"generation"`
+	Target         string   `json:"target"`
+	Roots          []string `json:"roots"`
+	Endpoint       string   `json:"endpoint,omitempty"`
+	Region         string   `json:"region,omitempty"`
+	ForcePathStyle bool     `json:"forcePathStyle,omitempty"`
+	// CredsSecretName travels request -> result -> status so the deletion
+	// path can build the cleanup Job without the (deleted) source pod.
+	CredsSecretName string `json:"credsSecretName,omitempty"`
+	ManifestDigest  string `json:"manifestDigest,omitempty"`
+	FilesTotal      int    `json:"filesTotal"`
+	FilesChanged    int    `json:"filesChanged"`
+	FilesDeleted    int    `json:"filesDeleted"`
+	BytesUploaded   int64  `json:"bytesUploaded"`
+	SyncSeconds     int64  `json:"syncSeconds"`
 }
 
 // QEMURequest contains the resolved QEMU workload contract.
@@ -66,6 +103,7 @@ type QEMURequest struct {
 type Result struct {
 	Containers     []ContainerResult `json:"containers"`
 	VirtualMachine *VMStateResult    `json:"virtualMachine,omitempty"`
+	S3Workspace    *S3Result         `json:"s3Workspace,omitempty"`
 }
 
 type ContainerResult struct {

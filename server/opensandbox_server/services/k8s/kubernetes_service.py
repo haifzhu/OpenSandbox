@@ -1139,6 +1139,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                     egress_settings=context.egress_settings,
                     volumes=request.volumes,
                     platform=request.platform,
+                    pause_policy=getattr(request, "pause_policy", None),
                 )
                 workload_left_alive = True
             except ValueError:

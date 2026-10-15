@@ -30,8 +30,9 @@ const (
 	labelBatchSandboxNameKey     = "batch-sandbox.sandbox.opensandbox.io/name"
 	labelPrivilegedNodeAccess    = "sandbox.opensandbox.io/privileged-node-access"
 
-	finalizerTaskCleanup    = "batch-sandbox.sandbox.opensandbox.io/task-cleanup"
-	finalizerPoolAllocation = "pool.sandbox.opensandbox.io/pool-allocation"
+	finalizerTaskCleanup      = "batch-sandbox.sandbox.opensandbox.io/task-cleanup"
+	finalizerWorkspaceCleanup = "sandbox.opensandbox.io/workspace-cleanup"
+	finalizerPoolAllocation   = "pool.sandbox.opensandbox.io/pool-allocation"
 )
 
 // annotationSandboxEndpoints Use the exported constant from pkg/utils

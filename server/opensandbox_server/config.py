@@ -28,7 +28,7 @@ import os
 import re
 import string
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Literal, Optional
+from typing import Any, ClassVar, Dict, List, Literal, Optional
 from urllib.parse import urlparse, urlsplit
 
 from kubernetes.utils.quantity import parse_quantity
@@ -295,6 +295,73 @@ class IdlePauseRedisConfig(BaseModel):
                 "[idle_pause] redis.dsn must be set when redis.enabled is true."
             )
         return self
+
+
+class PauseS3Config(BaseModel):
+    """S3-compatible object storage backend for s3-workspace pause.
+
+    One config drives any S3-protocol service (AWS S3, MinIO, Aliyun OSS S3
+    endpoint, Ceph RGW). Every object the pause sync writes lives under
+    ``base_prefix`` — the structural prefix-isolation rule — and request-level
+    bucket/prefix overrides must pass the allowlists.
+    """
+
+    endpoint: str = Field(
+        default="",
+        description=(
+            "S3-compatible endpoint, e.g. http://minio.opensandbox.svc:9000. "
+            "Empty means AWS S3 default addressing."
+        ),
+    )
+    region: str = Field(default="us-east-1", description="S3 region.")
+    bucket: str = Field(default="", description="Default snapshot bucket.")
+    base_prefix: str = Field(
+        default="",
+        description="Base key prefix; all snapshot objects are written under it.",
+    )
+    force_path_style: bool = Field(
+        default=False,
+        description="Path-style addressing (required by most MinIO/Ceph deployments).",
+    )
+    credentials_secret: str = Field(
+        default="",
+        description=(
+            "K8s Secret with accessKeyId/secretAccessKey/sessionToken keys, "
+            "projected into execd and restore init containers."
+        ),
+    )
+    allowed_buckets: List[str] = Field(
+        default_factory=list,
+        description="Whitelist for request-level pausePolicy.bucket overrides.",
+    )
+    allowed_prefixes: List[str] = Field(
+        default_factory=list,
+        description="Whitelist for request-level pausePolicy.prefix overrides.",
+    )
+    default_paths: List[str] = Field(
+        default_factory=lambda: ["/workspace"],
+        description="Default sync roots when pausePolicy.paths is omitted.",
+    )
+    execd_port: int = Field(
+        default=44772,
+        description="execd container port used by pause sync jobs.",
+    )
+    max_attempts: int = Field(
+        default=3,
+        ge=0,
+        description=(
+            "Circuit breaker: consecutive pause failures tolerated before the "
+            "server refuses further pauses with 409 (resume resets). 0 disables "
+            "the breaker (unlimited retries)."
+        ),
+    )
+
+
+class PauseConfig(BaseModel):
+    """Pause persistence backends. s3_workspace implements the OSS/MinIO/S3
+    workspace-sync pause provider; the default remains the OCI rootfs commit."""
+
+    s3: PauseS3Config = Field(default_factory=PauseS3Config)
 
 
 class IdlePauseConfig(BaseModel):
@@ -1547,6 +1614,10 @@ class AppConfig(BaseModel):
     renew_intent: RenewIntentConfig = Field(
         default_factory=RenewIntentConfig,
         description="Auto-renew sandbox expiration when reverse-proxy access is observed.",
+    )
+    pause: PauseConfig = Field(
+        default_factory=PauseConfig,
+        description="Pause persistence backend configuration.",
     )
     idle_pause: IdlePauseConfig = Field(
         default_factory=IdlePauseConfig,

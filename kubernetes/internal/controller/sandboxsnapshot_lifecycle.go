@@ -57,13 +57,6 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 		return ctrl.Result{}, err
 	}
 
-	if r.SnapshotRegistry == "" {
-		msg := "snapshot-registry not configured in controller manager"
-		log.Error(nil, msg)
-		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "RegistryNotConfigured", msg)
-		return ctrl.Result{}, nil
-	}
-
 	bs := &sandboxv1alpha1.BatchSandbox{}
 	if err := r.Get(ctx, types.NamespacedName{
 		Name:      snapshot.Spec.SandboxName,
@@ -90,6 +83,19 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 	snapshotFormat := sandboxv1alpha1.SandboxSnapshotFormatRootfsV1
 	if workloadContract.Provider == snapshotcontract.ProviderQEMU {
 		snapshotFormat = sandboxv1alpha1.SandboxSnapshotFormatQEMUV1
+	}
+	if workloadContract.Provider == snapshotcontract.ProviderS3Workspace {
+		snapshotFormat = sandboxv1alpha1.SandboxSnapshotFormatS3WorkspaceV1
+		return r.handlePendingS3Workspace(ctx, snapshot, pod, workloadContract.S3Workspace, snapshotFormat)
+	}
+
+	// The OCI registry is only required by the image-commit providers; the
+	// s3-workspace path returned above persists to object storage instead.
+	if r.SnapshotRegistry == "" {
+		msg := "snapshot-registry not configured in controller manager"
+		log.Error(nil, msg)
+		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "RegistryNotConfigured", msg)
+		return ctrl.Result{}, nil
 	}
 
 	sourcePodName := pod.Name
@@ -157,8 +163,14 @@ func (r *SandboxSnapshotReconciler) handleCommitting(ctx context.Context, snapsh
 
 	if job.Status.Succeeded > 0 {
 		log.Info("Commit job succeeded", "job", jobName)
-		if err := r.updateSnapshotStatusFromSucceededCommitJob(ctx, snapshot, job); err != nil {
-			return ctrl.Result{}, err
+		var statusErr error
+		if isS3WorkspaceSnapshot(snapshot) {
+			statusErr = r.updateSnapshotStatusFromSucceededSyncJob(ctx, snapshot, job)
+		} else {
+			statusErr = r.updateSnapshotStatusFromSucceededCommitJob(ctx, snapshot, job)
+		}
+		if statusErr != nil {
+			return ctrl.Result{}, statusErr
 		}
 		r.Recorder.Eventf(snapshot, corev1.EventTypeNormal, "JobSucceeded", "Commit job succeeded")
 		return ctrl.Result{}, nil
@@ -170,8 +182,12 @@ func (r *SandboxSnapshotReconciler) handleCommitting(ctx context.Context, snapsh
 			message = failedCond.Message
 		}
 		log.Info("Commit job failed", "job", jobName, "message", message)
-		if err := r.ensureUnpauseJob(ctx, snapshot, imageCommitterEnvValue(job, "SOURCE_POD_UID")); err != nil {
-			log.Error(err, "Failed to create best-effort unpause job")
+		// The unpause rollback only applies to containerd-frozen commits;
+		// s3-workspace syncs never freeze the source container.
+		if !isS3WorkspaceSnapshot(snapshot) {
+			if err := r.ensureUnpauseJob(ctx, snapshot, imageCommitterEnvValue(job, "SOURCE_POD_UID")); err != nil {
+				log.Error(err, "Failed to create best-effort unpause job")
+			}
 		}
 		r.Recorder.Eventf(snapshot, corev1.EventTypeWarning, "JobFailed", "Commit job failed")
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "CommitJobFailed", message)
@@ -876,7 +892,10 @@ func snapshotResultFromPod(pod *corev1.Pod) (*commitJobResult, bool, error) {
 		return nil, false, nil
 	}
 	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name != commitJobContainerName || status.State.Terminated == nil {
+		// The rootfs/qemu commit Job names its container "commit"; the
+		// s3-workspace sync Job names its trigger container "sync". Both
+		// report the same termination-message Result shape.
+		if (status.Name != commitJobContainerName && status.Name != workspaceSyncContainerName) || status.State.Terminated == nil {
 			continue
 		}
 		if status.State.Terminated.ExitCode != 0 {

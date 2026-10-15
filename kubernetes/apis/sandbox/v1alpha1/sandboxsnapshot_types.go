@@ -42,12 +42,13 @@ const (
 
 // SandboxSnapshotFormat identifies the persisted snapshot representation.
 // Existing snapshots without this field are interpreted as rootfs-v1.
-// +kubebuilder:validation:Enum=rootfs-v1;qemu-v1
+// +kubebuilder:validation:Enum=rootfs-v1;qemu-v1;s3-workspace-v1
 type SandboxSnapshotFormat string
 
 const (
-	SandboxSnapshotFormatRootfsV1 SandboxSnapshotFormat = "rootfs-v1"
-	SandboxSnapshotFormatQEMUV1   SandboxSnapshotFormat = "qemu-v1"
+	SandboxSnapshotFormatRootfsV1      SandboxSnapshotFormat = "rootfs-v1"
+	SandboxSnapshotFormatQEMUV1        SandboxSnapshotFormat = "qemu-v1"
+	SandboxSnapshotFormatS3WorkspaceV1 SandboxSnapshotFormat = "s3-workspace-v1"
 )
 
 // ContainerSnapshot records the snapshot result for a single container.
@@ -108,6 +109,45 @@ type VirtualMachineSnapshot struct {
 	Compatibility QEMUCompatibility `json:"compatibility"`
 }
 
+// WorkspaceSnapshot records the object-storage artifact of an s3-workspace-v1
+// snapshot: the workspace was synced to ObjectTarget at the given generation.
+// Resume keeps the original base image and restores these paths via an init
+// container.
+type WorkspaceSnapshot struct {
+	// Target is the canonical s3://bucket/prefix namespace synced.
+	Target string `json:"target"`
+	// Generation is the committed generation in that namespace.
+	// +kubebuilder:validation:Minimum=1
+	Generation uint64 `json:"generation"`
+	// ManifestDigest identifies the committed manifest (sha256 hex).
+	// +optional
+	ManifestDigest string `json:"manifestDigest,omitempty"`
+	// Roots are the absolute container paths covered by the sync.
+	Roots []string `json:"roots"`
+	// Endpoint is the S3-compatible endpoint used at pause time.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+	// Region is the S3 region used at pause time.
+	// +optional
+	Region string `json:"region,omitempty"`
+	// ForcePathStyle records path-style addressing for resume.
+	// +optional
+	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+	// FilesTotal is the number of entries in the committed manifest.
+	// +optional
+	FilesTotal int `json:"filesTotal,omitempty"`
+	// BytesUploaded is the delta bytes pushed by the committing sync.
+	// +optional
+	BytesUploaded int64 `json:"bytesUploaded,omitempty"`
+	// SyncSeconds is the wall-clock duration of the committing sync.
+	// +optional
+	SyncSeconds int64 `json:"syncSeconds,omitempty"`
+	// CredentialsSecretName names the Secret used for deletion-time cleanup
+	// of the object prefix.
+	// +optional
+	CredentialsSecretName string `json:"credentialsSecretName,omitempty"`
+}
+
 // SandboxSnapshotCondition represents a condition of a SandboxSnapshot.
 type SandboxSnapshotCondition struct {
 	// Type is the condition type.
@@ -156,6 +196,12 @@ type SandboxSnapshotStatus struct {
 	// VirtualMachine contains the QEMU VM state artifact for qemu-v1 snapshots.
 	// +optional
 	VirtualMachine *VirtualMachineSnapshot `json:"virtualMachine,omitempty"`
+
+	// Workspace contains the object-storage artifact result for
+	// s3-workspace-v1 snapshots. The base image is not replaced on resume;
+	// workspace paths are restored from this artifact by an init container.
+	// +optional
+	Workspace *WorkspaceSnapshot `json:"workspace,omitempty"`
 
 	// Conditions records the readiness or failure of the snapshot.
 	// +optional

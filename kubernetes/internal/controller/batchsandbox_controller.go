@@ -83,6 +83,10 @@ type BatchSandboxReconciler struct {
 	StatusRVExpectation expectations.ResourceVersionExpectation
 	// ResumePullSecret is the K8s Secret name for pulling snapshot images during resume.
 	ResumePullSecret string
+
+	// WorkspaceSyncImage is the s3-workspace sync/restore image used for
+	// workspace-restore init containers on resume.
+	WorkspaceSyncImage string
 	// FeatureConfig provides feature configuration loaded from the controller
 	// ConfigMap. Nil uses built-in defaults.
 	FeatureConfig *FeatureConfig
@@ -122,6 +126,9 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if errors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
+		return ctrl.Result{}, err
+	}
+	if handled, err := r.handleWorkspaceCleanup(ctx, batchSbx); handled {
 		return ctrl.Result{}, err
 	}
 	if expireAt := batchSbx.Spec.ExpireTime; expireAt != nil {

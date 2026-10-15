@@ -73,6 +73,11 @@ type SandboxSnapshotReconciler struct {
 	// ImageCommitterImage is the image used for commit and unpause Jobs.
 	ImageCommitterImage string
 
+	// WorkspaceSyncImage is the image used for s3-workspace sync Jobs
+	// (unprivileged; carries the workspace-sync and workspace-restore
+	// entrypoints built from components/execd).
+	WorkspaceSyncImage string
+
 	// ContainerdSocketPath is the host containerd socket mounted into image-committer Jobs.
 	ContainerdSocketPath string
 

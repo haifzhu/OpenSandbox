@@ -211,6 +211,9 @@ func main() {
 	var imageCommitterImage string
 	flag.StringVar(&imageCommitterImage, "image-committer-image", "image-committer:dev", "The image used for commit operations.")
 
+	var workspaceSyncImage string
+	flag.StringVar(&workspaceSyncImage, "workspace-sync-image", "", "The image used for s3-workspace sync Jobs (unprivileged; built from components/execd with workspace-sync/workspace-restore entrypoints).")
+
 	var imageCommitterPodTemplateFile string
 	flag.StringVar(&imageCommitterPodTemplateFile, "image-committer-pod-template-file", "", "Path to a PodTemplateSpec overlay for image-committer commit Job Pods.")
 
@@ -477,6 +480,7 @@ func main() {
 		Scheme:              mgr.GetScheme(),
 		Recorder:            mgr.GetEventRecorderFor("batchsandbox-controller"),
 		ResumePullSecret:    resumePullSecret,
+		WorkspaceSyncImage:  workspaceSyncImage,
 		ProfileStore:        profileStore,
 		StatusRVExpectation: expectations.NewResourceVersionExpectation(),
 		FeatureConfig:       featureConfig,
@@ -500,6 +504,7 @@ func main() {
 		Scheme:                    mgr.GetScheme(),
 		Recorder:                  mgr.GetEventRecorderFor("sandboxsnapshot-controller"),
 		ImageCommitterImage:       imageCommitterImage,
+		WorkspaceSyncImage:        workspaceSyncImage,
 		ContainerdSocketPath:      containerdSocketPath,
 		CommitJobTimeout:          commitJobTimeout,
 		SnapshotRegistry:          snapshotRegistry,
