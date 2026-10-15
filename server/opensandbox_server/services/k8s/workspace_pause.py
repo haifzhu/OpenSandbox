@@ -186,18 +186,17 @@ def apply_workspace_pause(
     # (running as root) reads them at sync time. Infra-side consumers (sync
     # Job, restore init, purge Job) keep env injection: those containers run
     # no user code.
+    # No `items` list on purpose: project every key of the Secret as a
+    # same-named file (accessKeyId / secretAccessKey / sessionToken — exactly
+    # the names execd reads). Listing items would force a decision on the
+    # optional sessionToken, and the typed Python client used by the control
+    # plane drops KeyToPath.optional (kubernetes==35 models lack it), which
+    # makes a static AK/SK Secret fail the whole volume mount.
     creds_volume = {
         "name": "objsync-creds",
         "secret": {
             "secretName": creds_secret,
             "defaultMode": 0o400,
-            "items": [
-                {"key": "accessKeyId", "path": "accessKeyId"},
-                {"key": "secretAccessKey", "path": "secretAccessKey"},
-                # sessionToken is optional: static AK/SK Secrets do not carry
-                # one, and a required projection would fail the whole mount.
-                {"key": "sessionToken", "path": "sessionToken", "optional": True},
-            ],
         },
     }
     if not any(v.get("name") == "objsync-creds" for v in pod_spec.get("volumes", [])):

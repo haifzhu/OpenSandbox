@@ -120,11 +120,11 @@ def test_apply_stamps_contract_and_volumes(wp):
     creds_vols = [v for v in pod_spec["volumes"] if v.get("name") == "objsync-creds"]
     assert len(creds_vols) == 1
     assert creds_vols[0]["secret"]["defaultMode"] == 0o400
-    # sessionToken must be optional: static AK/SK Secrets lack it and a
-    # required projection fails the whole volume mount (caught in e2e).
-    items = {i["key"]: i for i in creds_vols[0]["secret"]["items"]}
-    assert items["sessionToken"].get("optional") is True
-    assert "optional" not in items["accessKeyId"]
+    # No items list: the whole Secret is projected as same-named files, so a
+    # static AK/SK Secret (no sessionToken) cannot fail the mount. Listing
+    # items would need KeyToPath.optional, which the control plane's typed
+    # Python client silently drops (kubernetes==35 has no such field).
+    assert "items" not in creds_vols[0]["secret"]
     mounts = {m["mountPath"]: m for m in pod_spec["containers"][0]["volumeMounts"]}
     assert mounts["/opt/opensandbox/creds"]["readOnly"] is True
 
