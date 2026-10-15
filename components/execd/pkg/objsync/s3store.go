@@ -70,6 +70,10 @@ func NewS3Store(cfg S3Config) *S3Store {
 // resolveHost computes request URL host and object path for bucket/key.
 func (s *S3Store) resolveHost(bucket, key string) (string, string) {
 	endpoint := strings.TrimSuffix(s.cfg.Endpoint, "/")
+	// Scheme-less endpoints default to https so the URL stays valid.
+	if endpoint != "" && !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
+	}
 	if endpoint == "" {
 		if s.cfg.Region == "" || s.cfg.Region == "us-east-1" {
 			endpoint = "https://s3.amazonaws.com"
