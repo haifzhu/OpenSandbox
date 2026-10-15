@@ -18,6 +18,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -98,12 +99,13 @@ func (c *SnapshotController) SyncWorkspace() {
 		return
 	}
 
+	ak, sk, tok := syncCredentials()
 	store := objsync.NewS3Store(objsync.S3Config{
 		Endpoint:       req.Endpoint,
 		Region:         req.Region,
-		AccessKey:      os.Getenv(envAccessKeyID),
-		SecretKey:      os.Getenv(envSecretAccessKey),
-		SessionToken:   os.Getenv(envSessionToken),
+		AccessKey:      ak,
+		SecretKey:      sk,
+		SessionToken:   tok,
 		ForcePathStyle: req.ForcePathStyle,
 	})
 
@@ -136,3 +138,28 @@ func (c *SnapshotController) SyncWorkspace() {
 
 // StatusClientClosedRequest mirrors nginx's 499 for cancelled request bodies.
 const StatusClientClosedRequest = 499
+
+// defaultCredsDir is where the control plane projects the credentials Secret
+// as root-only files (mode 0400) in the sandbox container.
+const defaultCredsDir = "/opt/opensandbox/creds"
+
+// syncCredentials resolves object-store credentials: the projected root-only
+// credential files first (nothing lands in the process environment), the env
+// fallback second (used by infra containers such as the sync Job).
+func syncCredentials() (accessKey, secretKey, sessionToken string) {
+	dir := os.Getenv("OBJSYNC_CREDS_DIR")
+	if dir == "" {
+		dir = defaultCredsDir
+	}
+	read := func(name string) string {
+		data, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // fixed dir join
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(data))
+	}
+	if ak := read("accessKeyId"); ak != "" {
+		return ak, read("secretAccessKey"), read("sessionToken")
+	}
+	return os.Getenv(envAccessKeyID), os.Getenv(envSecretAccessKey), os.Getenv(envSessionToken)
+}

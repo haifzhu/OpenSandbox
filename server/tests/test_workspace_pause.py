@@ -107,16 +107,21 @@ def test_apply_stamps_contract_and_volumes(wp):
     assert annotations[wp.ANNOTATION_CHECKPOINT_PROVIDER] == "s3-workspace"
     assert annotations[wp.ANNOTATION_S3_PAUSE_CREDS_SECRET] == "oss-creds"
     assert annotations[wp.ANNOTATION_EXECD_PORT] == "44772"
-    # Volume layout from the first incarnation, contract-named.
-    assert len(pod_spec["volumes"]) == 2
+    # Volume layout from the first incarnation, contract-named, plus the
+    # root-only credentials volume.
+    assert len(pod_spec["volumes"]) == 3
     mounts = {m["mountPath"]: m["name"] for m in pod_spec["containers"][0]["volumeMounts"]}
-    assert mounts == {
-        "/workspace": "ws-c52ddf6553",
-        "/root/.lingma": "ws-27b691f987",
-    }
-    # execd credential env projection.
-    env_names = {e["name"] for e in pod_spec["containers"][0]["env"]}
-    assert {"OBJSYNC_ACCESS_KEY_ID", "OBJSYNC_SECRET_ACCESS_KEY"} <= env_names
+    assert mounts["/workspace"] == "ws-c52ddf6553"
+    assert mounts["/root/.lingma"] == "ws-27b691f987"
+    assert mounts["/opt/opensandbox/creds"] == "objsync-creds"
+    # Credentials as root-only files, NOT env.
+    env_names = {e.get("name") for e in pod_spec["containers"][0].get("env", [])}
+    assert not ({"OBJSYNC_ACCESS_KEY_ID", "OBJSYNC_SECRET_ACCESS_KEY"} & env_names)
+    creds_vols = [v for v in pod_spec["volumes"] if v.get("name") == "objsync-creds"]
+    assert len(creds_vols) == 1
+    assert creds_vols[0]["secret"]["defaultMode"] == 0o400
+    mounts = {m["mountPath"]: m for m in pod_spec["containers"][0]["volumeMounts"]}
+    assert mounts["/opt/opensandbox/creds"]["readOnly"] is True
 
 
 def test_volume_name_contract_parity(wp):

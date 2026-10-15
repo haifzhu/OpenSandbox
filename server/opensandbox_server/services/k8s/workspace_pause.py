@@ -180,28 +180,30 @@ def apply_workspace_pause(
         )
         mounts.append({"name": volume_name, "mountPath": root})
 
-    # execd reads the object-store credentials from its own environment;
-    # project the Secret the same way the restore init container will.
-    env = main.setdefault("env", [])
-    env_names = {e.get("name") for e in env}
-    for env_name, secret_key in (
-        ("OBJSYNC_ACCESS_KEY_ID", "accessKeyId"),
-        ("OBJSYNC_SECRET_ACCESS_KEY", "secretAccessKey"),
-        ("OBJSYNC_SESSION_TOKEN", "sessionToken"),
-    ):
-        if env_name in env_names:
-            continue
-        env.append(
-            {
-                "name": env_name,
-                "valueFrom": {
-                    "secretKeyRef": {
-                        "name": creds_secret,
-                        "key": secret_key,
-                        **({"optional": True} if secret_key == "sessionToken" else {}),
-                    }
-                },
-            }
+    # Credentials are delivered as ROOT-ONLY FILES (mode 0400) projected from
+    # the Secret at /opt/opensandbox/creds — never as container env, so user
+    # commands cannot see them via `env` or /proc/<execd>/environ. execd
+    # (running as root) reads them at sync time. Infra-side consumers (sync
+    # Job, restore init, purge Job) keep env injection: those containers run
+    # no user code.
+    creds_volume = {
+        "name": "objsync-creds",
+        "secret": {
+            "secretName": creds_secret,
+            "defaultMode": 0o400,
+            "items": [
+                {"key": "accessKeyId", "path": "accessKeyId"},
+                {"key": "secretAccessKey", "path": "secretAccessKey"},
+                {"key": "sessionToken", "path": "sessionToken"},
+            ],
+        },
+    }
+    if not any(v.get("name") == "objsync-creds" for v in pod_spec.get("volumes", [])):
+        pod_spec.setdefault("volumes", []).append(creds_volume)
+    mounts = main.setdefault("volumeMounts", [])
+    if not any(m.get("mountPath") == "/opt/opensandbox/creds" for m in mounts):
+        mounts.append(
+            {"name": "objsync-creds", "mountPath": "/opt/opensandbox/creds", "readOnly": True}
         )
 
     logger.info(

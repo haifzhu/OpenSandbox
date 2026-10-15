@@ -184,7 +184,7 @@ max_attempts = 3
 
 ## 8. 安全
 
-- v1:AK/SK(可选 sessionToken)走 K8s Secret(`credentialsSecretName`),以 env 投影给 execd/sync Job/restore init 容器;secret 不出现在公共 API 响应。
+- v1:AK/SK(可选 sessionToken)走 K8s Secret(`credentialsSecretName`)。**沙箱主容器以 0400 root-only 文件投影**(`/opt/opensandbox/creds`,execd 同步时读取),绝不以 env 形式进入沙箱——用户代码 `env` 与 `/proc/<execd>/environ` 均不可见,且 execd 子命令 env 黑名单兜底过滤 OBJSYNC_*;sync Job/restore init/purge Job 为无用户代码的 infra 容器,保留 env 投影。secret 不出现在公共 API 响应。
 - 授权最小化:存储侧策略按 `bucket/{prefix}/*` 收敛——MinIO policy、OSS RAM、AWS IAM 均支持前缀级 ARN/condition;配合 allowlist,请求级覆盖也出不了授权前缀。
 - Roadmap:workload identity / credential vault(OSEP-0012)/ 每 sandbox STS 临时凭证——OSEP-0015 已明确"凭证不过 API、不落 Secret"的方向,接口按 `credentialsSecretName` 抽象,后续替换实现不动契约。
 

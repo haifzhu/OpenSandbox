@@ -65,6 +65,13 @@ var execdConfigEnvBlacklist = []string{
 	"OPENSANDBOX_LIFECYCLE",
 	"EXECD_LIFECYCLE_CONFIG",
 	"EXECD_RUNTIME_INIT",
+	// Object-store credentials for the s3-workspace pause sync: never visible
+	// to user commands spawned by execd (they arrive via a root-only file, but
+	// the env fallback must be scrubbed too).
+	"OBJSYNC_ACCESS_KEY_ID",
+	"OBJSYNC_SECRET_ACCESS_KEY",
+	"OBJSYNC_SESSION_TOKEN",
+	"OBJSYNC_CREDS_DIR",
 }
 
 // ExecdConfigEnvBlacklist returns a copy of the execd config env names.
