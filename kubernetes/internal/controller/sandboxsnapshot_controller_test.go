@@ -297,12 +297,41 @@ func TestSandboxSnapshotHandlePending_MissingRegistrySetsFailedCondition(t *test
 			Name:      "test-snapshot",
 			Namespace: "default",
 		},
+		Spec: sandboxv1alpha1.SandboxSnapshotSpec{
+			SandboxName: "test-sbsource",
+		},
 		Status: sandboxv1alpha1.SandboxSnapshotStatus{
 			Phase: sandboxv1alpha1.SandboxSnapshotPhasePending,
 		},
 	}
 
-	r := newTestSnapshotReconciler(snapshot)
+	// The registry precheck runs after the source workload resolves (the
+	// s3-workspace provider needs no registry and is only distinguishable
+	// from the pod contract), so the fixture provides a BatchSandbox with a
+	// running rootfs pod to reach the registry check.
+	bs := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-sbsource",
+			Namespace: "default",
+			UID:       types.UID("test-sbsource-uid"),
+		},
+		Spec: sandboxv1alpha1.BatchSandboxSpec{
+			Replicas: ptrToInt32(1),
+		},
+	}
+	sourcePod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-sbsource-0",
+			Namespace: "default",
+			UID:       types.UID("test-sbsource-pod-uid"),
+			Labels: map[string]string{
+				labelBatchSandboxNameKey: "test-sbsource",
+			},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+
+	r := newTestSnapshotReconciler(snapshot, bs, sourcePod)
 
 	result, err := r.handlePending(context.Background(), snapshot)
 	require.NoError(t, err)

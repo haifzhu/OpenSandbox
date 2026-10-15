@@ -22,6 +22,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
+	snapshotcontract "github.com/alibaba/OpenSandbox/sandbox-k8s/internal/snapshot"
 )
 
 // TestWorkspaceVolumeNameContract pins the cross-repo volume-name algorithm.
@@ -58,6 +59,11 @@ func s3WorkspaceSnapshot() *sandboxv1alpha1.SandboxSnapshot {
 
 func baseTemplate() *corev1.PodTemplateSpec {
 	return &corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				snapshotcontract.AnnotationS3PauseCredsSecret: "s3-creds",
+			},
+		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "sandbox", Image: "base:1"}},
 		},
@@ -83,7 +89,7 @@ func TestInjectWorkspaceRestore(t *testing.T) {
 		t.Fatalf("restore init container not injected")
 	}
 	joined := strings.Join(init.Args, " ")
-	for _, want := range []string{"--generation 7", "--path-style", "/workspace,/root/.lingma", "s3://bucket/p/sandboxes/ns/sbx"} {
+	for _, want := range []string{"--generation 7", "--path-style", "--roots /root/.lingma,/workspace", "s3://bucket/p/sandboxes/ns/sbx"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("init args missing %q: %v", want, init.Args)
 		}
@@ -159,4 +165,35 @@ func TestInjectWorkspaceRestoreRequiresWorkspaceResult(t *testing.T) {
 
 func podWithAnnotations(annotations map[string]string) *corev1.Pod {
 	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: annotations}}
+}
+
+// TestInjectWorkspaceRestoreCredsFallback pins the fallback: a template
+// without the creds annotation still gets credentials from the snapshot
+// status (sandboxes created before the annotation existed).
+func TestInjectWorkspaceRestoreCredsFallback(t *testing.T) {
+	template := &corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "sandbox", Image: "base:1"}},
+		},
+	}
+	snapshot := s3WorkspaceSnapshot()
+	if err := injectWorkspaceRestore(template, snapshot, "syncer:1"); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	var init *corev1.Container
+	for i := range template.Spec.InitContainers {
+		if template.Spec.InitContainers[i].Name == workspaceRestoreInitName {
+			init = &template.Spec.InitContainers[i]
+		}
+	}
+	if init == nil {
+		t.Fatal("restore init container not injected")
+	}
+	found := map[string]bool{}
+	for _, env := range init.Env {
+		found[env.Name] = true
+	}
+	if !found["OBJSYNC_ACCESS_KEY_ID"] || !found["OBJSYNC_SECRET_ACCESS_KEY"] {
+		t.Fatal("credentials fallback to snapshot status did not apply")
+	}
 }

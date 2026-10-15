@@ -97,7 +97,10 @@ func injectWorkspaceRestore(template *corev1.PodTemplateSpec, snapshot *sandboxv
 			"--region", ws.Region,
 		},
 		VolumeMounts: mounts,
-		Env:          workspaceCredsEnv(template.Annotations[snapshotcontract.AnnotationS3PauseCredsSecret]),
+		// Credentials prefer the create-time template annotation; the
+		// snapshot status value is the fallback for sandboxes whose template
+		// predates the annotation.
+		Env: workspaceCredsEnv(workspaceCredsSecretName(template, ws)),
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                ptrToInt64(0),
 			RunAsNonRoot:             ptrToBool(false),
@@ -144,6 +147,15 @@ func containerHasMount(container *corev1.Container, path string) bool {
 		}
 	}
 	return false
+}
+
+// workspaceCredsSecretName resolves the credentials Secret for a resume:
+// template annotation first, snapshot status as fallback.
+func workspaceCredsSecretName(template *corev1.PodTemplateSpec, ws *sandboxv1alpha1.WorkspaceSnapshot) string {
+	if name := template.Annotations[snapshotcontract.AnnotationS3PauseCredsSecret]; name != "" {
+		return name
+	}
+	return ws.CredentialsSecretName
 }
 
 // workspaceCredsEnv builds the ordered OBJSYNC_* env projection for a
