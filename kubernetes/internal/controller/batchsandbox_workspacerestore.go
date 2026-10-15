@@ -94,7 +94,8 @@ func injectWorkspaceRestore(template *corev1.PodTemplateSpec, snapshot *sandboxv
 		// Credentials prefer the create-time template annotation; the
 		// snapshot status value is the fallback for sandboxes whose template
 		// predates the annotation.
-		Env: workspaceCredsEnv(workspaceCredsSecretName(template, ws)),
+		Env:       workspaceCredsEnv(workspaceCredsSecretName(template, ws)),
+		Resources: workspaceInfraResources,
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                ptrToInt64(0),
 			RunAsNonRoot:             ptrToBool(false),

@@ -23,6 +23,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -34,6 +35,21 @@ import (
 )
 
 const workspaceSyncContainerName = "sync"
+
+// workspaceInfraResources are the resource requests/limits applied to the
+// s3-workspace infrastructure containers (sync trigger, restore init, purge).
+// Namespaces under a ResourceQuota commonly require every container to
+// declare both requests and limits; these modest values are I/O-bound work.
+var workspaceInfraResources = corev1.ResourceRequirements{
+	Requests: corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("100m"),
+		corev1.ResourceMemory: resource.MustParse("128Mi"),
+	},
+	Limits: corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("500m"),
+		corev1.ResourceMemory: resource.MustParse("512Mi"),
+	},
+}
 
 // isS3WorkspaceSnapshot reports whether the snapshot persists via the
 // s3-workspace provider.
@@ -149,7 +165,8 @@ func (r *SandboxSnapshotReconciler) buildSyncJob(
 							Args: []string{
 								"--request-base64", base64.StdEncoding.EncodeToString(requestData),
 							},
-							Env: env,
+							Env:       env,
+							Resources: workspaceInfraResources,
 							// Unprivileged by design: this Job only performs an
 							// HTTP call against execd on the pod network.
 							SecurityContext: &corev1.SecurityContext{

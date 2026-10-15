@@ -126,6 +126,7 @@ func (r *BatchSandboxReconciler) ensureWorkspacePurgeJob(ctx context.Context, bs
 			"--endpoint", annotations[snapshotcontract.AnnotationS3PauseEndpoint],
 			"--region", annotations[snapshotcontract.AnnotationS3PauseRegion],
 		},
+		Resources: workspaceInfraResources,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptrToBool(false),
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},

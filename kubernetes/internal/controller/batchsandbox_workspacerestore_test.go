@@ -255,3 +255,33 @@ func findRestoreInit(t *testing.T, template *corev1.PodTemplateSpec) *corev1.Con
 	t.Fatal("restore init container missing")
 	return nil
 }
+
+// TestWorkspaceInfraContainersDeclareResources pins ResourceQuota
+// compatibility: namespaces commonly require every container (including
+// init containers and Job pods) to declare requests AND limits, so the
+// restore init, sync trigger, and purge containers must never ship bare.
+func TestWorkspaceInfraContainersDeclareResources(t *testing.T) {
+	template := baseTemplate()
+	snapshot := s3WorkspaceSnapshot()
+	if err := injectWorkspaceRestore(template, snapshot, "syncer:1"); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	init := findRestoreInit(t, template)
+	if init.Resources.Requests.Cpu().IsZero() || init.Resources.Limits.Memory().IsZero() {
+		t.Fatalf("restore init container must declare requests and limits: %+v", init.Resources)
+	}
+
+	// Sync trigger container.
+	r := newTestSnapshotReconciler()
+	snap := s3WorkspaceSnapshot()
+	job, err := r.buildSyncJob(snap, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "sbx-0"}}, &snapshotcontract.S3WorkspaceContract{
+		Target: "s3://b/p", Roots: []string{"/workspace"}, ExecDPort: 44772,
+	})
+	if err != nil {
+		t.Fatalf("buildSyncJob: %v", err)
+	}
+	sync := job.Spec.Template.Spec.Containers[0]
+	if sync.Resources.Requests.Cpu().IsZero() || sync.Resources.Limits.Memory().IsZero() {
+		t.Fatalf("sync trigger container must declare requests and limits: %+v", sync.Resources)
+	}
+}
