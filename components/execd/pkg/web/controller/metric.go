@@ -23,6 +23,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/alibaba/opensandbox/execd/pkg/log"
+	"github.com/alibaba/opensandbox/execd/pkg/objsync"
 	"github.com/alibaba/opensandbox/execd/pkg/resources"
 	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
@@ -98,6 +99,9 @@ func (c *MetricController) readMetrics() (*model.Metrics, error) {
 	}
 	metric.MemTotalMiB = float64(memStats.TotalBytes) / 1024 / 1024
 	metric.MemUsedMiB = float64(memStats.UsedBytes) / 1024 / 1024
+
+	// s3-workspace data plane metrics (objsync).
+	metric.ObjSync = objsync.Global.Snapshot()
 
 	return metric, nil
 }

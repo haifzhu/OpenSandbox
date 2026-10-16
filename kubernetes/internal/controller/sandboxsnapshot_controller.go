@@ -154,6 +154,9 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
+	// Update the phase gauge (cheap; label count is small).
+	s3wsMetrics.snapshotsByPhase.WithLabelValues(string(snapshot.Status.Phase)).Set(1)
+
 	// Dispatch by phase
 	switch snapshot.Status.Phase {
 	case "", sandboxv1alpha1.SandboxSnapshotPhasePending:

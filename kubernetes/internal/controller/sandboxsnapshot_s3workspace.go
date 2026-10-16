@@ -221,6 +221,10 @@ func (r *SandboxSnapshotReconciler) updateSnapshotStatusFromSucceededSyncJob(ctx
 		}
 		latest.Status.Phase = sandboxv1alpha1.SandboxSnapshotPhaseSucceed
 		applySnapshotPhaseConditions(&latest.Status, "", "")
+
+		s3wsMetrics.syncBytes.Add(float64(s3.BytesUploaded))
+		s3wsMetrics.pauseDuration.Observe(float64(s3.SyncSeconds))
+
 		return r.Status().Update(ctx, latest)
 	})
 }

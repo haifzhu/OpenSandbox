@@ -17,11 +17,12 @@ package model
 import "time"
 
 type Metrics struct {
-	CpuCount    float64 `json:"cpu_count"`
-	CpuUsedPct  float64 `json:"cpu_used_pct"`
-	MemTotalMiB float64 `json:"mem_total_mib"`
-	MemUsedMiB  float64 `json:"mem_used_mib"`
-	Timestamp   int64   `json:"timestamp"`
+	CpuCount    float64          `json:"cpu_count"`
+	CpuUsedPct  float64          `json:"cpu_used_pct"`
+	MemTotalMiB float64          `json:"mem_total_mib"`
+	MemUsedMiB  float64          `json:"mem_used_mib"`
+	Timestamp   int64            `json:"timestamp"`
+	ObjSync     map[string]int64 `json:"objSync,omitempty"`
 }
 
 func NewMetrics() *Metrics {

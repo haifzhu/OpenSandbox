@@ -159,7 +159,9 @@ func (s *S3Store) do(ctx context.Context, req request, out io.Writer) (http.Head
 		httpReq.Header.Set("x-amz-content-sha256", payloadSHA)
 	}
 
+	reqStart := time.Now()
 	resp, err := s.client.Do(httpReq)
+	Global.RecordOss(time.Since(reqStart), err != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -176,6 +178,7 @@ func (s *S3Store) do(ctx context.Context, req request, out io.Writer) (http.Head
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, ErrNotFound
 	default:
+		Global.RecordOss(0, true)
 		msg := readS3Error(resp.Body)
 		return nil, fmt.Errorf("s3 %s %s%s: HTTP %d: %s", req.method, req.bucket, path, resp.StatusCode, msg)
 	}

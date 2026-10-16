@@ -49,6 +49,7 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (*Mani
 	if len(opts.Roots) == 0 {
 		return nil, errors.New("objsync: no restore roots")
 	}
+	restoreStart := time.Now()
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = 4
@@ -150,6 +151,7 @@ dispatch:
 		fmt.Fprintf(os.Stderr, "objsync: restore: directory mtime restore failed for %d entries (idempotency fence degraded): %v\n",
 			len(chtimesFailed), chtimesFailed)
 	}
+	Global.RecordRestore(time.Since(restoreStart), manifest.Stats.BytesScanned, int64(len(manifest.Files)))
 	return manifest, ctx.Err()
 }
 

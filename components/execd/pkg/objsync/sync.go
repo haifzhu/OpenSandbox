@@ -142,6 +142,7 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	// zero-change pauses reuse the standing generation instead of stacking
 	// identical ones.
 	if old != nil && manifestsEquivalent(old, manifest) {
+		Global.RecordSync(time.Since(start), 0, 0, true)
 		return &SyncResult{
 			Generation:    old.Generation,
 			Stats:         manifest.Stats,
@@ -174,6 +175,7 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	}
 
 	manifest.Stats.DurationMS = time.Since(start).Milliseconds()
+	Global.RecordSync(time.Since(start), bytesUploaded.Load(), int64(len(walk.ToUpload)), false)
 	return &SyncResult{
 		Generation:    generation,
 		Stats:         manifest.Stats,

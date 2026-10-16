@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/alibaba/opensandbox/execd/pkg/objsync"
 )
 
 // workspaceSyncGate implements the pause-time write-quiesce contract
@@ -79,6 +81,7 @@ func mutatingSyncGateMiddleware() gin.HandlerFunc {
 			return
 		}
 		if !theWorkspaceSyncGate.mu.TryRLock() {
+			objsync.Global.RecordGateRejection()
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 				"error": "workspace sync in progress; retry shortly",
 			})
@@ -94,6 +97,7 @@ func mutatingSyncGateMiddleware() gin.HandlerFunc {
 // ok=false and a janitor releases the eventually-acquired lock without ever
 // holding it, so a caller that gave up cannot deadlock later syncs.
 func beginWorkspaceSync(drainWait time.Duration) (release func(), ok bool) {
+	drainStart := time.Now()
 	acquired := make(chan struct{})
 	go func() {
 		theWorkspaceSyncGate.mu.Lock()
@@ -101,6 +105,7 @@ func beginWorkspaceSync(drainWait time.Duration) (release func(), ok bool) {
 	}()
 	select {
 	case <-acquired:
+		objsync.Global.RecordGateDrain(time.Since(drainStart))
 		return theWorkspaceSyncGate.mu.Unlock, true
 	case <-time.After(drainWait):
 		go func() {

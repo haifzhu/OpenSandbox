@@ -190,6 +190,7 @@ func (r *SandboxSnapshotReconciler) handleCommitting(ctx context.Context, snapsh
 			}
 		}
 		r.Recorder.Eventf(snapshot, corev1.EventTypeWarning, "JobFailed", "Commit job failed")
+		s3wsMetrics.syncFailures.WithLabelValues("JobFailed").Inc()
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "CommitJobFailed", message)
 		return ctrl.Result{}, nil
 	}
