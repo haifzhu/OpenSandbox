@@ -19,6 +19,9 @@ package objsync
 import (
 	"os"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func fileOwner(fi os.FileInfo) int {
@@ -40,4 +43,15 @@ func fileGroup(fi os.FileInfo) int {
 // that do not support it are non-fatal (mode is still applied by the caller).
 func writeMetadata(path string, uid, gid int) {
 	_ = syscall.Chown(path, uid, gid) //nolint:gosec // best-effort ownership restore
+}
+
+// lutimes sets the timestamps of a symbolic link itself (without following
+// it). macOS/Linux both expose this as UTIME_OMIT-free lutimens; Go's
+// syscall.Lutimes covers both.
+func lutimes(path string, atime, mtime time.Time) error {
+	tv := []unix.Timeval{
+		unix.NsecToTimeval(atime.UnixNano()),
+		unix.NsecToTimeval(mtime.UnixNano()),
+	}
+	return unix.Lutimes(path, tv)
 }

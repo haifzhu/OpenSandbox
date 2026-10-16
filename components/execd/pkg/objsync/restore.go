@@ -173,7 +173,16 @@ func restoreEntry(ctx context.Context, store ObjectStore, opts RestoreOptions, g
 		if err := os.Remove(entry.Path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove stale symlink %s: %w", entry.Path, err)
 		}
-		return os.Symlink(buf.String(), entry.Path)
+		if err := os.Symlink(buf.String(), entry.Path); err != nil {
+			return fmt.Errorf("symlink %s: %w", entry.Path, err)
+		}
+		// The symlink's own lstat mtime is part of its fingerprint; leaving
+		// it at creation time would break the no-change idempotency fence
+		// on every restore cycle (a new generation per pause, 0 bytes).
+		if err := lutimes(entry.Path, timeOf(entry), timeOf(entry)); err != nil {
+			return fmt.Errorf("lutimes symlink %s: %w", entry.Path, err)
+		}
+		return nil
 	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(entry.Path), ".objsync-restore-*")

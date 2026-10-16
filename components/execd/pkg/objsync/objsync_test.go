@@ -542,3 +542,54 @@ func TestSyncNoChangeKeepsGeneration(t *testing.T) {
 		t.Fatalf("no-change sync wrote objects: %d -> %d", keysAfterFirst, got)
 	}
 }
+
+// TestSymlinkMtimeSurvivesRestoreForFence pins the no-change idempotency
+// fence when symlinks are present: restore must recreate them with the
+// recorded lstat mtime, not creation time (test-env finding: gen bumped
+// every pause with 0 bytes uploaded, diff was only the link's mtimeNano).
+func TestSymlinkMtimeSurvivesRestoreForFence(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemStore(0)
+	target := mustTarget(t)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "target.txt"), "x", 0o644)
+	if err := os.Symlink("target.txt", filepath.Join(root, "lnk")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond) // ensure mtime is distinct from "now"
+	syncer := &Syncer{Store: store}
+	if _, err := syncer.Sync(ctx, SyncOptions{Roots: []string{root}, Target: target}); err != nil {
+		t.Fatal(err)
+	}
+	_, lnkBefore, _ := symlinkMtime(t, filepath.Join(root, "lnk"))
+
+	wipeTree(t, root)
+	if _, err := Restore(ctx, store, RestoreOptions{Target: target, Roots: []string{root}}); err != nil {
+		t.Fatal(err)
+	}
+	_, lnkAfter, _ := symlinkMtime(t, filepath.Join(root, "lnk"))
+	// Filesystem rounding (APFS sub-μs) may shift the restored value by a
+	// few hundred ns; the FENCE (checked below) tolerates that via
+	// manifestsEquivalent's mtimeTolerance.
+	if d := lnkAfter - lnkBefore; d > 2000 || d < -2000 {
+		t.Fatalf("symlink mtime drifted beyond tolerance: before=%d after=%d", lnkBefore, lnkAfter)
+	}
+
+	// Second sync must be a no-op (fence holds).
+	res, err := syncer.Sync(ctx, SyncOptions{Roots: []string{root}, Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Generation != 1 {
+		t.Fatalf("no-change sync with symlink bumped generation to %d, want 1", res.Generation)
+	}
+}
+
+func symlinkMtime(t *testing.T, path string) (time.Time, int64, error) {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	return fi.ModTime(), fi.ModTime().UnixNano(), nil
+}

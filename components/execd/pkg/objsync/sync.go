@@ -334,13 +334,22 @@ func ReadManifest(ctx context.Context, store ObjectStore, target Target, generat
 }
 
 // manifestsEquivalent compares the file sets of two manifests, ignoring
-// generation, timestamps, and stats.
+// generation, top-level timestamps, and stats. File mtimeNano is compared
+// with a small tolerance: filesystems like APFS round restored timestamps
+// at sub-microsecond granularity, and treating that drift as a change would
+// defeat the no-change fence on every restore cycle.
 func manifestsEquivalent(a, b *Manifest) bool {
 	if len(a.Files) != len(b.Files) {
 		return false
 	}
+	const mtimeTolerance = 2_000 // ns; covers APFS rounding artefacts
 	for i := range a.Files {
-		if a.Files[i] != b.Files[i] {
+		x, y := a.Files[i], b.Files[i]
+		x.MtimeNano, y.MtimeNano = 0, 0
+		if x != y {
+			return false
+		}
+		if diff := a.Files[i].MtimeNano - b.Files[i].MtimeNano; diff > mtimeTolerance || diff < -mtimeTolerance {
 			return false
 		}
 	}
