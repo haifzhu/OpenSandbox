@@ -15,8 +15,14 @@
 package controller
 
 import (
+	"context"
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	sandboxv1alpha1 "github.com/alibaba/OpenSandbox/sandbox-k8s/apis/sandbox/v1alpha1"
 )
 
 // s3wsMetrics are the s3-workspace Prometheus metrics, registered on the
@@ -25,7 +31,6 @@ import (
 // rules consume; per-sandbox detail lives in execd's /metrics endpoint
 // (queried on demand for debugging, not scraped).
 var s3wsMetrics = struct {
-	sandboxesByState *prometheus.GaugeVec
 	snapshotsByPhase *prometheus.GaugeVec
 	pauseDuration    prometheus.Histogram
 	resumeDuration   prometheus.Histogram
@@ -34,13 +39,6 @@ var s3wsMetrics = struct {
 	circuitBreaker   prometheus.Counter
 	purgeJobs        *prometheus.CounterVec
 }{
-	sandboxesByState: prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "s3ws_sandboxes",
-			Help: "Number of s3-workspace sandboxes by BatchSandbox phase.",
-		},
-		[]string{"state"},
-	),
 
 	pauseDuration: prometheus.NewHistogram(
 		prometheus.HistogramOpts{
@@ -95,7 +93,6 @@ func init() {
 	)
 
 	metrics.Registry.MustRegister(
-		s3wsMetrics.sandboxesByState,
 		s3wsMetrics.snapshotsByPhase,
 		s3wsMetrics.pauseDuration,
 		s3wsMetrics.resumeDuration,
@@ -104,4 +101,60 @@ func init() {
 		s3wsMetrics.circuitBreaker,
 		s3wsMetrics.purgeJobs,
 	)
+}
+
+// sandboxStateDesc describes s3ws_sandboxes{state,provider}.
+var sandboxStateDesc = prometheus.NewDesc(
+	"s3ws_sandboxes",
+	"Number of BatchSandboxes by phase (provider=s3-workspace|other).",
+	[]string{"state", "provider"}, nil,
+)
+
+// SandboxStateCollector lists BatchSandboxes at scrape time and reports the
+// count per phase. Listing on scrape (every 30s) is far cheaper than
+// maintaining an incrementally-updated gauge in every reconcile, and it can
+// never drift.
+type SandboxStateCollector struct {
+	Reader client.Reader
+}
+
+// Describe implements prometheus.Collector.
+func (c *SandboxStateCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- sandboxStateDesc
+}
+
+// Collect implements prometheus.Collector.
+func (c *SandboxStateCollector) Collect(ch chan<- prometheus.Metric) {
+	if c.Reader == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	list := &sandboxv1alpha1.BatchSandboxList{}
+	if err := c.Reader.List(ctx, list); err != nil {
+		return
+	}
+	type key struct{ state, provider string }
+	counts := map[key]int{}
+	for i := range list.Items {
+		bs := &list.Items[i]
+		provider := "other"
+		if isS3WorkspaceBatchSandbox(bs) {
+			provider = "s3-workspace"
+		}
+		state := string(bs.Status.Phase)
+		if state == "" {
+			state = "Pending"
+		}
+		counts[key{state, provider}]++
+	}
+	for k, n := range counts {
+		ch <- prometheus.MustNewConstMetric(sandboxStateDesc, prometheus.GaugeValue, float64(n), k.state, k.provider)
+	}
+}
+
+// RegisterSandboxStateCollector wires the scrape-time collector.
+func RegisterSandboxStateCollector(reader client.Reader) error {
+	return metrics.Registry.Register(&SandboxStateCollector{Reader: reader})
 }

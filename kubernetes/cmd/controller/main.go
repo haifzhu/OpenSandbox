@@ -519,6 +519,12 @@ func main() {
 	}
 	// +kubebuilder:scaffold:builder
 
+	// s3-workspace: report BatchSandbox counts per phase at scrape time.
+	if err := controller.RegisterSandboxStateCollector(mgr.GetClient()); err != nil {
+		setupLog.Error(err, "unable to register s3-workspace sandbox state collector")
+		os.Exit(1)
+	}
+
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")
 		if err := mgr.Add(metricsCertWatcher); err != nil {
