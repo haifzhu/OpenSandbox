@@ -76,14 +76,13 @@ type SyncResult struct {
 // missing blobs, write the new manifest and swap LATEST. It is idempotent:
 // re-running against the same tree produces the same generation content and
 // re-uploads nothing (content-addressed blobs).
-func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error) {
+func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (result *SyncResult, err error) {
 	if len(opts.Roots) == 0 {
 		return nil, errors.New("objsync: no sync roots")
 	}
 	start := time.Now()
 	progressBegin("sync")
-	var syncErr error
-	defer func() { progressEnd(syncErr) }()
+	defer func() { progressEnd(err) }()
 
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
@@ -109,8 +108,7 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	progressPhase("walking")
 	walk, err := Walk(ctx, opts.Roots, opts.Exclude, old, opts.Verify, concurrency)
 	if err != nil {
-		syncErr = fmt.Errorf("walk: %w", err)
-		return nil, syncErr
+		return nil, fmt.Errorf("walk: %w", err)
 	}
 	var totalBytes int64
 	for i := range walk.Entries {

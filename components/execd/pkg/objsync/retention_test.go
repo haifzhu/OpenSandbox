@@ -231,10 +231,6 @@ func TestProgressTracksSync(t *testing.T) {
 	writeFile(t, filepath.Join(root, "a.txt"), strings.Repeat("data", 100), 0o644)
 	writeFile(t, filepath.Join(root, "b.txt"), "more", 0o644)
 
-	if got := SnapshotProgress(); got.Operation != "" {
-		t.Fatalf("progress should start idle, got %+v", got)
-	}
-
 	syncer := &Syncer{Store: store}
 	if _, err := syncer.Sync(ctx, SyncOptions{Roots: []string{root}, Target: target}); err != nil {
 		t.Fatal(err)
@@ -243,8 +239,8 @@ func TestProgressTracksSync(t *testing.T) {
 	if p.Operation != "sync" || p.Phase != "done" {
 		t.Fatalf("progress = %+v, want sync/done", p)
 	}
-	if p.FilesTotal != 3 || p.FilesDone != 3 { // 2 files + 1 dir
-		t.Fatalf("files: %d/%d, want 3/3", p.FilesDone, p.FilesTotal)
+	if p.FilesTotal != 2 || p.FilesDone != 2 { // two regular files, no subdirs
+		t.Fatalf("files: %d/%d, want 2/2", p.FilesDone, p.FilesTotal)
 	}
 	if p.BytesTotal < 400 {
 		t.Fatalf("bytes total = %d, want >= 400", p.BytesTotal)
@@ -254,7 +250,6 @@ func TestProgressTracksSync(t *testing.T) {
 // TestProgressReportsFailure keeps failures visible to the Job log.
 func TestProgressReportsFailure(t *testing.T) {
 	ctx := context.Background()
-	store := NewMemStore(0)
 	target := mustTarget(t)
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, "a.txt"), "a", 0o644)

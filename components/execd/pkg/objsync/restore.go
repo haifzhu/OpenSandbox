@@ -47,14 +47,13 @@ type RestoreOptions struct {
 // Restore materializes the latest (or pinned) generation under the roots.
 // Files are downloaded to a sibling temp file, digest-verified, then renamed
 // into place; any mismatch aborts the whole restore.
-func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (*Manifest, error) {
+func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (result *Manifest, err error) {
 	if len(opts.Roots) == 0 {
 		return nil, errors.New("objsync: no restore roots")
 	}
 	restoreStart := time.Now()
 	progressBegin("restore")
-	var restoreErr error
-	defer func() { progressEnd(restoreErr) }()
+	defer func() { progressEnd(err) }()
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = 4
@@ -137,7 +136,6 @@ dispatch:
 	wg.Wait()
 	select {
 	case err := <-errCh:
-		restoreErr = err
 		return nil, err
 	default:
 	}
