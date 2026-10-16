@@ -55,6 +55,9 @@ func NewRouter(accessToken string) *gin.Engine {
 	r.GET("/ping", controller.PingHandler)
 	r.POST("/internal/init", withInit(func(c *controller.InitController) { c.Init() }))
 	r.GET("/ready", withInit(func(c *controller.InitController) { c.Ready() }))
+	r.GET("/internal/snapshot/status", func(ctx *gin.Context) {
+		controller.NewSnapshotController(ctx).Status()
+	})
 	r.POST("/internal/snapshot/sync", func(ctx *gin.Context) {
 		// Write-quiesce: drain in-flight mutating requests (bounded), then
 		// hold exclusive access for the whole sync so the manifest describes

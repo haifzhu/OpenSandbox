@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // RestoreOptions configures one restore run.
@@ -50,6 +52,9 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (*Mani
 		return nil, errors.New("objsync: no restore roots")
 	}
 	restoreStart := time.Now()
+	progressBegin("restore")
+	var restoreErr error
+	defer func() { progressEnd(restoreErr) }()
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = 4
@@ -79,6 +84,8 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (*Mani
 		}
 	}
 
+	progressPhase("downloading")
+	progressTotals("restore", len(manifest.Files), manifest.Stats.BytesScanned)
 	// Directories first (depth order by construction: Walk emits parents
 	// before children and manifest.Sort is path-lexicographic, which for
 	// clean absolute paths still orders parents before their children).
@@ -110,6 +117,7 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (*Mani
 					errCh <- err
 					return
 				}
+				progressFile(it.entry.Path, it.entry.Size)
 			}
 		}()
 	}
@@ -129,6 +137,7 @@ dispatch:
 	wg.Wait()
 	select {
 	case err := <-errCh:
+		restoreErr = err
 		return nil, err
 	default:
 	}
@@ -162,7 +171,7 @@ func restoreEntry(ctx context.Context, store ObjectStore, opts RestoreOptions, g
 	if entry.SHA256 == "" {
 		return fmt.Errorf("entry %s missing digest", entry.Path)
 	}
-	key := opts.Target.blobKey(entry.SHA256)
+	key := opts.Target.blobKeyFor(entry.SHA256, entry.Encoding)
 
 	if entry.Type == TypeSymlink {
 		var buf bytes.Buffer
@@ -195,7 +204,7 @@ func restoreEntry(ctx context.Context, store ObjectStore, opts RestoreOptions, g
 	defer os.Remove(tmpName) // no-op after successful rename
 
 	h := sha256.New()
-	if _, err := store.Get(ctx, opts.Target.Bucket, key, io.MultiWriter(tmp, h)); err != nil {
+	if err := fetchBlob(ctx, store, opts.Target.Bucket, key, entry.Encoding, io.MultiWriter(tmp, h)); err != nil {
 		tmp.Close()
 		return fmt.Errorf("fetch blob %s: %w", entry.Path, err)
 	}
@@ -239,4 +248,34 @@ func timeOf(entry FileEntry) time.Time {
 	sec := entry.MtimeNano / int64(time.Second)
 	nsec := entry.MtimeNano % int64(time.Second)
 	return time.Unix(sec, nsec)
+}
+
+// fetchBlob streams a blob into w, transparently decompressing when the
+// manifest says the payload is compressed. The digest check downstream is
+// always computed over the ORIGINAL content, so integrity is verified the
+// same way for both encodings.
+func fetchBlob(ctx context.Context, store ObjectStore, bucket, key, encoding string, w io.Writer) error {
+	switch encoding {
+	case "":
+		_, err := store.Get(ctx, bucket, key, w)
+		return err
+	case EncodingZstd:
+		// Stream through a pipe so large blobs never sit in memory.
+		pr, pw := io.Pipe()
+		go func() {
+			_, err := store.Get(ctx, bucket, key, pw)
+			_ = pw.CloseWithError(err)
+		}()
+		dec, err := zstd.NewReader(pr)
+		if err != nil {
+			return fmt.Errorf("init zstd reader: %w", err)
+		}
+		defer dec.Close()
+		if _, err := io.Copy(w, dec); err != nil {
+			return fmt.Errorf("decompress: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported blob encoding %q (this manifest was written by a newer writer)", encoding)
+	}
 }

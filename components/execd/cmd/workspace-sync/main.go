@@ -124,15 +124,49 @@ func run(req syncRequest, timeout time.Duration) error {
 	url := fmt.Sprintf("http://%s:%d/internal/snapshot/sync", req.SourcePodIP, req.ExecDPort)
 
 	client := &http.Client{Timeout: timeout}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("call execd %s: %w", url, err)
+
+	// Kick the sync off in the background and narrate its progress: a first
+	// sync of a multi-GB workspace takes minutes, and a silent wait in the
+	// Job log is indistinguishable from a hang.
+	type postResult struct {
+		body []byte
+		code int
+		err  error
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("execd answered HTTP %d: %s", resp.StatusCode, string(respBody))
+	done := make(chan postResult, 1)
+	go func() {
+		resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+		if err != nil {
+			done <- postResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		done <- postResult{body: rb, code: resp.StatusCode}
+	}()
+
+	statusURL := fmt.Sprintf("http://%s:%d/internal/snapshot/status", req.SourcePodIP, req.ExecDPort)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	var post postResult
+	waiting := true
+	for waiting {
+		select {
+		case post = <-done:
+			waiting = false
+		case <-ticker.C:
+			if line := progressLine(statusURL); line != "" {
+				fmt.Println(line)
+			}
+		}
 	}
+	if post.err != nil {
+		return fmt.Errorf("call execd %s: %w", url, post.err)
+	}
+	if post.code != http.StatusOK {
+		return fmt.Errorf("execd answered HTTP %d: %s", post.code, string(post.body))
+	}
+	respBody := post.body
 
 	var syncResp struct {
 		Generation uint64 `json:"generation"`
@@ -276,4 +310,37 @@ func fatal(msg string, err error) {
 		fmt.Fprintf(os.Stderr, "workspace-sync: %s\n", msg)
 	}
 	os.Exit(1)
+}
+
+// progressLine renders one progress line from execd's status endpoint, or ""
+// when nothing is running (or execd does not answer).
+func progressLine(statusURL string) string {
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(statusURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	var p struct {
+		Operation   string `json:"operation"`
+		Phase       string `json:"phase"`
+		FilesTotal  int    `json:"filesTotal"`
+		FilesDone   int    `json:"filesDone"`
+		BytesTotal  int64  `json:"bytesTotal"`
+		BytesDone   int64  `json:"bytesDone"`
+		CurrentFile string `json:"currentFile"`
+		ElapsedMs   int64  `json:"elapsedMs"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil || p.Operation == "" {
+		return ""
+	}
+	pct := 0.0
+	if p.BytesTotal > 0 {
+		pct = float64(p.BytesDone) / float64(p.BytesTotal) * 100
+	} else if p.FilesTotal > 0 {
+		pct = float64(p.FilesDone) / float64(p.FilesTotal) * 100
+	}
+	return fmt.Sprintf("workspace-sync: %s %s %.1f%% — %d/%d files, %d/%d bytes (%.1fs)",
+		p.Operation, p.Phase, pct, p.FilesDone, p.FilesTotal, p.BytesDone, p.BytesTotal, float64(p.ElapsedMs)/1000)
 }

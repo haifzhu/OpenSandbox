@@ -26,6 +26,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // DefaultPartSize is the multipart threshold and part size for uploads.
@@ -46,6 +48,13 @@ type SyncOptions struct {
 	Concurrency int
 	// PartSize is the multipart threshold/chunk size (default 8MiB).
 	PartSize int64
+	// RetentionGenerations keeps the newest N generations; older ones and
+	// their unreferenced blobs are collected after a successful commit.
+	// 0 means DefaultRetentionGenerations.
+	RetentionGenerations int
+	// Compress enables zstd for content that shrinks by at least
+	// compressionGainThreshold; incompressible data stays raw.
+	Compress bool
 }
 
 // Syncer runs incremental syncs against one store.
@@ -72,6 +81,10 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		return nil, errors.New("objsync: no sync roots")
 	}
 	start := time.Now()
+	progressBegin("sync")
+	var syncErr error
+	defer func() { progressEnd(syncErr) }()
+
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
 		concurrency = 4
@@ -93,10 +106,20 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		}
 	}
 
+	progressPhase("walking")
 	walk, err := Walk(ctx, opts.Roots, opts.Exclude, old, opts.Verify, concurrency)
 	if err != nil {
-		return nil, fmt.Errorf("walk: %w", err)
+		syncErr = fmt.Errorf("walk: %w", err)
+		return nil, syncErr
 	}
+	var totalBytes int64
+	for i := range walk.Entries {
+		if walk.Entries[i].Type == TypeRegular {
+			totalBytes += walk.Entries[i].Size
+		}
+	}
+	progressTotals("sync", len(walk.Entries), totalBytes)
+	progressPhase("uploading")
 
 	oldHashes := map[string]struct{}{}
 	if old != nil {
@@ -114,8 +137,15 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	var uploaded, bytesUploaded atomic.Int64
 	skipped := atomic.Int64{}
-	if err := s.uploadBlobs(ctx, opts, walk.ToUpload, oldHashes, generation, partSize, concurrency, &uploaded, &bytesUploaded, &skipped); err != nil {
+	encodings := map[string]string{}
+	if err := s.uploadBlobs(ctx, opts, walk.ToUpload, oldHashes, generation, partSize, concurrency, &uploaded, &bytesUploaded, &skipped, encodings); err != nil {
 		return nil, err
+	}
+	// Stamp the storage encoding onto the manifest entries.
+	for i := range walk.Entries {
+		if enc, ok := encodings[walk.Entries[i].Path]; ok {
+			walk.Entries[i].Encoding = enc
+		}
 	}
 
 	manifest := &Manifest{
@@ -153,6 +183,7 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		}, nil
 	}
 
+	progressPhase("manifest")
 	manifestBody, digest, err := encodeJSON(manifest)
 	if err != nil {
 		return nil, err
@@ -172,6 +203,15 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	}
 	if err := s.Store.Put(ctx, opts.Target.Bucket, opts.Target.latestKey(), bytes.NewReader(latestBody), int64(len(latestBody)), ""); err != nil {
 		return nil, fmt.Errorf("put LATEST: %w", err)
+	}
+
+	progressPhase("gc")
+	// Retention GC: trim old generations and their orphaned blobs. Best
+	// effort — a GC failure must not fail a committed sync.
+	if gc, gcErr := GC(ctx, s.Store, opts.Target, opts.RetentionGenerations); gcErr != nil {
+		fmt.Fprintf(os.Stderr, "objsync: gc skipped: %v\n", gcErr)
+	} else if gc.GenerationsDeleted > 0 || gc.BlobsDeleted > 0 {
+		Global.RecordGC(gc.GenerationsDeleted, gc.BlobsDeleted)
 	}
 
 	manifest.Stats.DurationMS = time.Since(start).Milliseconds()
@@ -198,10 +238,15 @@ func (s *Syncer) uploadBlobs(
 	partSize int64,
 	concurrency int,
 	uploaded, bytesUploaded, skipped *atomic.Int64,
+	encodings map[string]string,
 ) error {
 	type job struct {
-		entry FileEntry
-		key   string
+		entry    FileEntry
+		key      string
+		encoding string
+		// payload is non-nil when the bytes were prepared in memory
+		// (compressed or small raw); nil means stream from disk.
+		payload []byte
 	}
 	jobs := make(chan job)
 	errCh := make(chan error, concurrency)
@@ -216,11 +261,12 @@ func (s *Syncer) uploadBlobs(
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				if err := s.uploadOne(ctx, opts, j.entry, j.key, partSize, bytesUploaded); err != nil {
+				if err := s.uploadOne(ctx, opts, j.entry, j.key, j.payload, partSize, bytesUploaded); err != nil {
 					errCh <- err
 					return
 				}
 				uploaded.Add(1)
+				progressFile(j.entry.Path, j.entry.Size)
 			}
 		}()
 	}
@@ -231,17 +277,28 @@ dispatch:
 			errCh <- fmt.Errorf("entry %s has no digest", entry.Path)
 			break
 		}
-		if _, known := oldHashes[entry.SHA256]; known {
+		// The encoding decision must happen before the existence check: it
+		// determines the blob key.
+		encoding, payload, err := s.preparePayload(entry, opts.Compress)
+		if err != nil {
+			errCh <- err
+			break
+		}
+		if encodings != nil {
+			encodings[entry.Path] = encoding
+		}
+		if _, known := oldHashes[entry.SHA256]; known && encoding == "" {
+			// A previous generation already stored this content raw.
 			skipped.Add(1)
 			continue
 		}
-		key := opts.Target.blobKey(entry.SHA256)
+		key := opts.Target.blobKeyFor(entry.SHA256, encoding)
 		if _, exists, err := s.Store.Head(ctx, opts.Target.Bucket, key); err == nil && exists {
 			skipped.Add(1)
 			continue
 		}
 		select {
-		case jobs <- job{entry: entry, key: key}:
+		case jobs <- job{entry: entry, key: key, encoding: encoding, payload: payload}:
 		case <-ctx.Done():
 			break dispatch
 		}
@@ -256,7 +313,35 @@ dispatch:
 	return ctx.Err()
 }
 
-func (s *Syncer) uploadOne(ctx context.Context, opts SyncOptions, entry FileEntry, key string, partSize int64, bytesUploaded *atomic.Int64) error {
+// zstdEncoder is shared: EncodeAll is safe for concurrent use, and the
+// encoder holds no per-stream state between calls.
+var zstdEncoder, _ = zstd.NewWriter(nil,
+	zstd.WithEncoderLevel(zstd.SpeedDefault),
+	zstd.WithEncoderConcurrency(1))
+
+// preparePayload decides how a file's bytes are stored. Compressible files in
+// the eligible size window are zstd-compressed in memory when that wins at
+// least compressionGainThreshold; everything else streams from disk unchanged.
+func (s *Syncer) preparePayload(entry FileEntry, compress bool) (string, []byte, error) {
+	if entry.Type != TypeRegular || !compress {
+		return "", nil, nil
+	}
+	if entry.Size < compressMinSize || entry.Size > compressMaxSize {
+		return "", nil, nil
+	}
+	raw, err := os.ReadFile(entry.Path) //nolint:gosec // path comes from our own walk
+	if err != nil {
+		return "", nil, fmt.Errorf("read %s for compression: %w", entry.Path, err)
+	}
+	compressed := zstdEncoder.EncodeAll(raw, nil)
+	if float64(len(compressed)) > float64(len(raw))*compressionGainThreshold {
+		return "", nil, nil // not worth it; stream raw
+	}
+	Global.RecordCompression(int64(len(compressed)), int64(len(raw)))
+	return EncodingZstd, compressed, nil
+}
+
+func (s *Syncer) uploadOne(ctx context.Context, opts SyncOptions, entry FileEntry, key string, payload []byte, partSize int64, bytesUploaded *atomic.Int64) error {
 	switch entry.Type {
 	case TypeSymlink:
 		target, err := os.Readlink(entry.Path)
@@ -270,6 +355,14 @@ func (s *Syncer) uploadOne(ctx context.Context, opts SyncOptions, entry FileEntr
 		bytesUploaded.Add(int64(len(body)))
 		return nil
 	case TypeRegular:
+		if payload != nil {
+			// Compressed (or small raw) bytes prepared in memory.
+			if err := s.Store.Put(ctx, opts.Target.Bucket, key, bytes.NewReader(payload), int64(len(payload)), ""); err != nil {
+				return fmt.Errorf("put %s: %w", entry.Path, err)
+			}
+			bytesUploaded.Add(int64(len(payload)))
+			return nil
+		}
 		f, err := os.Open(entry.Path) //nolint:gosec // path comes from our own walk
 		if err != nil {
 			return fmt.Errorf("open %s: %w", entry.Path, err)

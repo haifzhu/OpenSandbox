@@ -49,6 +49,13 @@ type Metrics struct {
 
 	// Multipart per-part timing (last part, for bottleneck diagnosis).
 	MpuPartMs atomic.Int64
+
+	// Retention GC.
+	GCRuns            atomic.Int64
+	GCGenerations     atomic.Int64
+	GCBlobs           atomic.Int64
+	GCCompressedBytes atomic.Int64
+	GCRawBytes        atomic.Int64
 }
 
 // Global is the process-wide metrics instance; execd is single-sandbox-per-pod.
@@ -83,6 +90,15 @@ func (m *Metrics) RecordOss(dur time.Duration, isErr bool) {
 func (m *Metrics) RecordGateRejection()              { m.GateRejections.Add(1) }
 func (m *Metrics) RecordGateDrain(dur time.Duration) { m.GateDrainMs.Store(dur.Milliseconds()) }
 func (m *Metrics) RecordMpuPart(dur time.Duration)   { m.MpuPartMs.Store(dur.Milliseconds()) }
+func (m *Metrics) RecordGC(generations, blobs int) {
+	m.GCRuns.Add(1)
+	m.GCGenerations.Add(int64(generations))
+	m.GCBlobs.Add(int64(blobs))
+}
+func (m *Metrics) RecordCompression(compressed, raw int64) {
+	m.GCCompressedBytes.Add(compressed)
+	m.GCRawBytes.Add(raw)
+}
 
 // Snapshot returns a plain map suitable for JSON serialisation.
 func (m *Metrics) Snapshot() map[string]int64 {
@@ -104,5 +120,10 @@ func (m *Metrics) Snapshot() map[string]int64 {
 		"objsync_gate_rejections":     m.GateRejections.Load(),
 		"objsync_gate_drain_ms":       m.GateDrainMs.Load(),
 		"objsync_mpu_part_ms":         m.MpuPartMs.Load(),
+		"objsync_gc_runs":             m.GCRuns.Load(),
+		"objsync_gc_generations":      m.GCGenerations.Load(),
+		"objsync_gc_blobs":            m.GCBlobs.Load(),
+		"objsync_compressed_bytes":    m.GCCompressedBytes.Load(),
+		"objsync_raw_bytes":           m.GCRawBytes.Load(),
 	}
 }

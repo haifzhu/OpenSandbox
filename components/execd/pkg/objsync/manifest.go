@@ -41,6 +41,16 @@ const (
 	// FormatVersionV1 is the manifest format produced by this implementation.
 	FormatVersionV1 = "s3-workspace-v1"
 
+	// EncodingZstd marks a blob whose payload is a zstd frame of the file.
+	EncodingZstd = "zstd"
+	// compressMinSize / compressMaxSize bound which files are considered for
+	// compression: tiny files gain nothing, huge files would need a second
+	// on-disk copy (they take the streaming multipart path instead).
+	compressMinSize int64 = 4 << 10  // 4 KiB
+	compressMaxSize int64 = 64 << 20 // 64 MiB
+	// compressionGainThreshold keeps incompressible payloads raw.
+	compressionGainThreshold = 0.90
+
 	latestKeySuffix   = "LATEST"
 	manifestKeyFormat = "gen/%d/manifest.json"
 	blobKeyFormat     = "blobs/%s/%s"
@@ -59,6 +69,10 @@ type FileEntry struct {
 	// SHA256 identifies the blob: file content digest for "reg", the digest of
 	// the link target string for "link", empty for "dir".
 	SHA256 string `json:"sha256,omitempty"`
+	// Encoding is how the blob payload is stored: "" = raw, "zstd" =
+	// zstd-compressed. It is part of the blob key, so identical content
+	// stored under different encodings can never collide.
+	Encoding string `json:"encoding,omitempty"`
 }
 
 // File type constants.
@@ -178,8 +192,21 @@ func (t Target) manifestKey(generation uint64) string {
 	return t.join(fmt.Sprintf(manifestKeyFormat, generation))
 }
 
+func (t Target) genPrefix() string  { return t.join("gen/") }
+func (t Target) blobPrefix() string { return t.join("blobs/") }
+
 func (t Target) blobKey(sha256 string) string {
-	return t.join(fmt.Sprintf(blobKeyFormat, sha256[:2], sha256))
+	return t.blobKeyFor(sha256, "")
+}
+
+// blobKeyFor builds the blob key for a given encoding. Raw blobs keep the
+// legacy key shape ("blobs/xx/<sha>") so existing data stays readable;
+// compressed blobs carry a suffix and can never be mistaken for raw ones.
+func (t Target) blobKeyFor(sha256, encoding string) string {
+	if encoding == "" {
+		return t.join(fmt.Sprintf(blobKeyFormat, sha256[:2], sha256))
+	}
+	return t.join(fmt.Sprintf(blobKeyFormat, sha256[:2], sha256) + "." + encoding)
 }
 
 // join builds an object key under the target base. Building every key through

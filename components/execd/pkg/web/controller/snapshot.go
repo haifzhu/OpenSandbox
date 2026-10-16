@@ -163,3 +163,10 @@ func syncCredentials() (accessKey, secretKey, sessionToken string) {
 	}
 	return os.Getenv(envAccessKeyID), os.Getenv(envSecretAccessKey), os.Getenv(envSessionToken)
 }
+
+// Status reports the in-flight sync/restore progress. Called by the pause
+// sync Job so `kubectl logs` shows movement during long uploads, and usable
+// ad hoc for debugging a stuck pause.
+func (c *SnapshotController) Status() {
+	c.ctx.JSON(http.StatusOK, objsync.SnapshotProgress())
+}
