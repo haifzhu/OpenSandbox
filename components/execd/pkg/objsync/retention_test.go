@@ -17,6 +17,8 @@ package objsync
 import (
 	"context"
 	"crypto/rand"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -264,5 +266,63 @@ func TestProgressReportsFailure(t *testing.T) {
 	}
 	if p := SnapshotProgress(); p.Phase != "failed" || p.LastError == "" {
 		t.Fatalf("progress = %+v, want failed with LastError", p)
+	}
+}
+
+// noListStore fails every List call, simulating a bucket whose policy grants
+// object operations only (the common case for a shared distribution bucket).
+type noListStore struct{ inner *MemStore }
+
+func (s *noListStore) Get(ctx context.Context, bucket, key string, w io.Writer) (int64, error) {
+	return s.inner.Get(ctx, bucket, key, w)
+}
+func (s *noListStore) Put(ctx context.Context, bucket, key string, r io.Reader, size int64, sha string) error {
+	return s.inner.Put(ctx, bucket, key, r, size, sha)
+}
+func (s *noListStore) PutMultipart(ctx context.Context, bucket, key string, r io.Reader, size, part int64) error {
+	return s.inner.PutMultipart(ctx, bucket, key, r, size, part)
+}
+func (s *noListStore) Head(ctx context.Context, bucket, key string) (int64, bool, error) {
+	return s.inner.Head(ctx, bucket, key)
+}
+func (s *noListStore) Delete(ctx context.Context, bucket, key string) error {
+	return s.inner.Delete(ctx, bucket, key)
+}
+func (s *noListStore) List(context.Context, string, string, string, int) ([]string, string, error) {
+	return nil, "", errors.New("AccessDenied: list not permitted")
+}
+
+// TestGCWorksWithoutListPermission is the property that makes GC usable in
+// environments that grant object operations but not ListObjects: the
+// collector must never need to enumerate keys.
+func TestGCWorksWithoutListPermission(t *testing.T) {
+	ctx := context.Background()
+	inner := NewMemStore(0)
+	store := &noListStore{inner: inner}
+	target := mustTarget(t)
+	root := t.TempDir()
+	syncer := &Syncer{Store: store}
+
+	for gen := 1; gen <= 5; gen++ {
+		writeFile(t, filepath.Join(root, "churn.txt"), strings.Repeat("v", gen*64), 0o644)
+		time.Sleep(2 * time.Millisecond)
+		if _, err := syncer.Sync(ctx, SyncOptions{
+			Roots: []string{root}, Target: target, RetentionGenerations: 3,
+		}); err != nil {
+			t.Fatalf("sync gen %d: %v", gen, err)
+		}
+	}
+
+	// Old generations gone, survivors intact — all without a single List.
+	keys := inner.Keys(target.Bucket)
+	for _, gone := range []string{"gen/1/manifest.json", "gen/2/manifest.json"} {
+		for _, k := range keys {
+			if strings.HasSuffix(k, gone) {
+				t.Fatalf("trimmed manifest still present: %s (keys=%v)", k, keys)
+			}
+		}
+	}
+	if _, err := Restore(ctx, store, RestoreOptions{Target: target, Roots: []string{root}}); err != nil {
+		t.Fatalf("restore after list-free GC: %v", err)
 	}
 }

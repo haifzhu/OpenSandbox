@@ -16,8 +16,8 @@ package objsync
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -38,61 +38,44 @@ type GCStats struct {
 // GC trims a sandbox's object namespace to the newest `keep` generations and
 // deletes blobs that no retained generation references.
 //
-// Safety: a blob is deleted only when it appears in NO retained manifest, so
-// every generation that survives GC remains fully restorable. Runs after a
-// successful sync (best-effort: callers log and continue on error).
+// It needs NO list permission: generation keys are deterministic
+// (gen/<N>/manifest.json) and contiguous, so the collector walks back from the
+// current generation until a key is missing. That keeps the required bucket
+// permissions to Get/Head/Put/Delete, which is all an object-store pause
+// should need.
 //
-// Requires list permission on the prefix (oss:ListObjects / s3:ListBucket).
-// Without it, GC returns an error and the caller skips it — objects then
-// accumulate and rely on the bucket lifecycle policy.
+// Safety: a blob is deleted only when it appears in NO retained manifest, and
+// an unreadable retained manifest aborts the pass — every surviving generation
+// stays restorable.
 func GC(ctx context.Context, store ObjectStore, target Target, keep int) (*GCStats, error) {
 	if keep < 1 {
 		keep = DefaultRetentionGenerations
 	}
-
 	stats := &GCStats{}
 
-	// 1. Find all generation manifests.
-	genKeys, err := listAll(ctx, store, target, target.genPrefix(), "")
+	latest, err := ReadLatest(ctx, store, target)
 	if err != nil {
-		return nil, fmt.Errorf("list generations: %w", err)
-	}
-	genPrefix := target.genPrefix()
-	gens := map[uint64]string{} // generation -> full manifest key
-	for _, key := range genKeys {
-		rel, ok := strings.CutPrefix(key, genPrefix)
-		if !ok {
-			continue
+		if errors.Is(err, ErrNotFound) {
+			return stats, nil // nothing committed yet
 		}
-		gen, ok := parseGenManifest(rel)
-		if !ok {
-			continue
-		}
-		gens[gen] = key
+		return stats, fmt.Errorf("read LATEST: %w", err)
 	}
-	if len(gens) <= keep {
-		return stats, nil // nothing to trim
+	current := latest.Generation
+	if current <= uint64(keep) {
+		return stats, nil // within the retention window
 	}
 
-	// 2. Decide which generations survive (highest numbers win).
-	numbers := make([]uint64, 0, len(gens))
-	for n := range gens {
-		numbers = append(numbers, n)
-	}
-	sort.Slice(numbers, func(i, j int) bool { return numbers[i] > numbers[j] })
-	kept := map[uint64]struct{}{}
-	for i := 0; i < keep && i < len(numbers); i++ {
-		kept[numbers[i]] = struct{}{}
-	}
-
-	// 3. Collect every blob hash the survivors reference.
+	// 1. Collect every blob hash the survivors reference. An unreadable
+	//    survivor aborts: deleting anything then would risk orphaning data.
 	referenced := map[string]struct{}{}
-	for gen := range kept {
+	for i := 0; i < keep; i++ {
+		gen := current - uint64(i)
 		manifest, err := ReadManifest(ctx, store, target, gen, "")
 		if err != nil {
-			// A retained manifest we cannot read means we must not delete
-			// anything: abort rather than risk removing a needed blob.
-			return nil, fmt.Errorf("read retained manifest gen %d: %w", gen, err)
+			if errors.Is(err, ErrNotFound) {
+				break // gap in the sequence; nothing further to protect
+			}
+			return stats, fmt.Errorf("read retained manifest gen %d: %w", gen, err)
 		}
 		for _, f := range manifest.Files {
 			if f.SHA256 != "" {
@@ -101,54 +84,47 @@ func GC(ctx context.Context, store ObjectStore, target Target, keep int) (*GCSta
 		}
 	}
 
-	// 4. Delete the expired manifests.
-	for gen, key := range gens {
-		if _, ok := kept[gen]; ok {
-			continue
+	// 2. Walk back through the doomed generations, deleting each one's
+	//    manifest and any blob the survivors do not reference.
+	walked := 0
+	for gen := current - uint64(keep); gen >= 1 && walked < maxGCWalkBack; gen-- {
+		walked++
+		manifest, err := ReadManifest(ctx, store, target, gen, "")
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				break
+			}
+			return stats, fmt.Errorf("read doomed manifest gen %d: %w", gen, err)
 		}
-		if err := store.Delete(ctx, target.Bucket, key); err != nil {
+		seen := map[string]struct{}{}
+		for _, f := range manifest.Files {
+			if f.SHA256 == "" {
+				continue
+			}
+			if _, ok := referenced[f.SHA256]; ok {
+				continue
+			}
+			if _, dup := seen[f.SHA256]; dup {
+				continue
+			}
+			seen[f.SHA256] = struct{}{}
+			key := target.blobKeyFor(f.SHA256, f.Encoding)
+			if err := store.Delete(ctx, target.Bucket, key); err != nil {
+				return stats, fmt.Errorf("delete blob %s: %w", f.SHA256[:12], err)
+			}
+			stats.BlobsDeleted++
+		}
+		if err := store.Delete(ctx, target.Bucket, target.manifestKey(gen)); err != nil {
 			return stats, fmt.Errorf("delete manifest gen %d: %w", gen, err)
 		}
 		stats.GenerationsDeleted++
 	}
-
-	// 5. Delete blobs no survivor references.
-	blobKeys, err := listAll(ctx, store, target, target.blobPrefix(), "")
-	if err != nil {
-		// Manifests are already trimmed; report what we did and surface the
-		// blob-phase failure so the caller can log it.
-		return stats, fmt.Errorf("list blobs: %w", err)
-	}
-	for _, key := range blobKeys {
-		hash := key[strings.LastIndex(key, "/")+1:]
-		if _, ok := referenced[hash]; ok {
-			continue
-		}
-		if err := store.Delete(ctx, target.Bucket, key); err != nil {
-			return stats, fmt.Errorf("delete blob %s: %w", hash, err)
-		}
-		stats.BlobsDeleted++
-	}
 	return stats, nil
 }
 
-// listAll pages through every key under prefix.
-func listAll(ctx context.Context, store ObjectStore, target Target, prefix, _ string) ([]string, error) {
-	full := prefix
-	var all []string
-	marker := ""
-	for {
-		keys, next, err := store.List(ctx, target.Bucket, full, marker, 1000)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, keys...)
-		if next == "" {
-			return all, nil
-		}
-		marker = next
-	}
-}
+// maxGCWalkBack bounds the back-walk when a namespace somehow has a very long
+// history; the next pass continues from the retained window.
+const maxGCWalkBack = 200
 
 // parseGenManifest parses the portion of a manifest key after the target's
 // "gen/" prefix, i.e. "<N>/manifest.json".
