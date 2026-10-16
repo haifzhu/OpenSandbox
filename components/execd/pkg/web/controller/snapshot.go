@@ -54,6 +54,12 @@ type snapshotSyncRequest struct {
 	Verify bool `json:"verify,omitempty"`
 	// Concurrency bounds hash/upload workers.
 	Concurrency int `json:"concurrency,omitempty"`
+	// Retention caps kept generations (0 = library default of 3).
+	Retention int `json:"retention,omitempty"`
+	// Compress is tri-state: nil enables adaptive zstd (the default), false
+	// forces raw payloads. Incompressible content always stays raw, so
+	// leaving it unset is the sensible default.
+	Compress *bool `json:"compress,omitempty"`
 }
 
 type snapshotSyncResponse struct {
@@ -110,13 +116,7 @@ func (c *SnapshotController) SyncWorkspace() {
 	})
 
 	syncer := &objsync.Syncer{Store: store}
-	result, err := syncer.Sync(c.ctx.Request.Context(), objsync.SyncOptions{
-		Roots:       req.Roots,
-		Exclude:     req.Exclude,
-		Target:      target,
-		Verify:      req.Verify,
-		Concurrency: req.Concurrency,
-	})
+	result, err := syncer.Sync(c.ctx.Request.Context(), buildSyncOptions(req, target))
 	if err != nil {
 		// Context cancellation propagates as a non-retryable 499-style
 		// answer; everything else is retryable at the Job level.
@@ -162,6 +162,26 @@ func syncCredentials() (accessKey, secretKey, sessionToken string) {
 		return ak, read("secretAccessKey"), read("sessionToken")
 	}
 	return os.Getenv(envAccessKeyID), os.Getenv(envSecretAccessKey), os.Getenv(envSessionToken)
+}
+
+// buildSyncOptions maps the wire request onto engine options. Kept separate
+// from the handler so the defaults (compression on, retention from the
+// library) are directly testable — a default that silently never reaches the
+// engine is invisible at runtime.
+func buildSyncOptions(req snapshotSyncRequest, target objsync.Target) objsync.SyncOptions {
+	compress := true
+	if req.Compress != nil {
+		compress = *req.Compress
+	}
+	return objsync.SyncOptions{
+		Roots:                req.Roots,
+		Exclude:              req.Exclude,
+		Target:               target,
+		Verify:               req.Verify,
+		Concurrency:          req.Concurrency,
+		RetentionGenerations: req.Retention,
+		Compress:             compress,
+	}
 }
 
 // Status reports the in-flight sync/restore progress. Called by the pause
