@@ -397,28 +397,40 @@ func (s *S3Store) PutMultipart(ctx context.Context, bucket, key string, r io.Rea
 	totalParts := int((size + partSize - 1) / partSize)
 	partETags := make([]string, totalParts+1)
 
-	// A bounded worker pool feeds from a channel of part specs; the single
-	// reader goroutine streams sequential chunks so disk IO stays sequential.
-	type partSpec struct {
+	// A single reader goroutine reads the source sequentially into buffers
+	// and feeds them to a channel; upload workers take pre-read buffers.
+	// Disk IO stays sequential AND no two goroutines ever touch the same
+	// reader — io.LimitReader is not goroutine-safe, so workers reading
+	// from a shared reader would interleave bytes across parts (silent
+	// data corruption).
+	type partBuf struct {
 		number int
-		size   int64
+		data   []byte
 	}
-	specs := make(chan partSpec, totalParts)
+	bufs := make(chan partBuf, mpuConcurrency)
+	errCh := make(chan error, mpuConcurrency+1)
 	go func() {
-		defer close(specs)
-		remaining := size
+		defer close(bufs)
 		for n := 1; n <= totalParts; n++ {
 			chunk := partSize
-			if remaining < chunk {
+			if remaining := size - int64(n-1)*partSize; remaining < chunk {
 				chunk = remaining
 			}
-			specs <- partSpec{number: n, size: chunk}
-			remaining -= chunk
+			data := make([]byte, chunk)
+			if _, err := io.ReadFull(r, data); err != nil {
+				// Signal workers to stop; the error surfaces via errCh.
+				close(bufs)
+				select {
+				case errCh <- fmt.Errorf("read part %d: %w", n, err):
+				default:
+				}
+				return
+			}
+			bufs <- partBuf{number: n, data: data}
 		}
 	}()
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 1)
 	workers := mpuConcurrency
 	if totalParts < workers {
 		workers = totalParts
@@ -427,17 +439,16 @@ func (s *S3Store) PutMultipart(ctx context.Context, bucket, key string, r io.Rea
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for spec := range specs {
-				chunk := io.LimitReader(r, spec.size)
-				etag, err := s.uploadPart(ctx, bucket, key, uploadID, spec.number, chunk, spec.size)
+			for pb := range bufs {
+				etag, err := s.uploadPart(ctx, bucket, key, uploadID, pb.number, bytes.NewReader(pb.data), int64(len(pb.data)))
 				if err != nil {
 					select {
-					case errCh <- fmt.Errorf("part %d: %w", spec.number, err):
+					case errCh <- fmt.Errorf("part %d: %w", pb.number, err):
 					default:
 					}
 					return
 				}
-				partETags[spec.number] = etag
+				partETags[pb.number] = etag
 			}
 		}()
 	}
