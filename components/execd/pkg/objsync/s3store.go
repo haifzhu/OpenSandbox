@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -372,6 +373,12 @@ type mpuPart struct {
 	etag   string
 }
 
+// mpuConcurrency is the number of parts uploaded in parallel. Parts are
+// independent HTTP requests against the same multipart upload session, so
+// they parallelize trivially; 4 saturates typical OSS links without tripping
+// per-connection rate limits.
+const mpuConcurrency = 4
+
 func (s *S3Store) PutMultipart(ctx context.Context, bucket, key string, r io.Reader, size, partSize int64) error {
 	if partSize < 5<<20 {
 		partSize = 5 << 20 // S3 minimum part size
@@ -387,21 +394,68 @@ func (s *S3Store) PutMultipart(ctx context.Context, bucket, key string, r io.Rea
 		}, nil)
 	}
 
-	parts := make([]mpuPart, 0, size/partSize+1)
-	partNumber := 0
-	for remaining := size; remaining > 0; {
-		partNumber++
-		chunk := partSize
-		if remaining < chunk {
-			chunk = remaining
+	totalParts := int((size + partSize - 1) / partSize)
+	partETags := make([]string, totalParts+1)
+
+	// A bounded worker pool feeds from a channel of part specs; the single
+	// reader goroutine streams sequential chunks so disk IO stays sequential.
+	type partSpec struct {
+		number int
+		size   int64
+	}
+	specs := make(chan partSpec, totalParts)
+	go func() {
+		defer close(specs)
+		remaining := size
+		for n := 1; n <= totalParts; n++ {
+			chunk := partSize
+			if remaining < chunk {
+				chunk = remaining
+			}
+			specs <- partSpec{number: n, size: chunk}
+			remaining -= chunk
 		}
-		etag, err := s.uploadPart(ctx, bucket, key, uploadID, partNumber, io.LimitReader(r, chunk), chunk)
-		if err != nil {
+	}()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+	workers := mpuConcurrency
+	if totalParts < workers {
+		workers = totalParts
+	}
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for spec := range specs {
+				chunk := io.LimitReader(r, spec.size)
+				etag, err := s.uploadPart(ctx, bucket, key, uploadID, spec.number, chunk, spec.size)
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("part %d: %w", spec.number, err):
+					default:
+					}
+					return
+				}
+				partETags[spec.number] = etag
+			}
+		}()
+	}
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		abort()
+		return err
+	default:
+	}
+
+	parts := make([]mpuPart, 0, totalParts)
+	for n := 1; n <= totalParts; n++ {
+		if partETags[n] == "" {
 			abort()
-			return err
+			return fmt.Errorf("part %d missing etag", n)
 		}
-		parts = append(parts, mpuPart{number: partNumber, etag: etag})
-		remaining -= chunk
+		parts = append(parts, mpuPart{number: n, etag: partETags[n]})
 	}
 	if err := s.completeMPU(ctx, bucket, key, uploadID, parts); err != nil {
 		abort()
