@@ -109,7 +109,12 @@ func Walk(ctx context.Context, roots, exclude []string, old *Manifest, verify bo
 			}
 
 			if prev, ok := oldIndex[path]; ok && !verify && stableFingerprint(&prev) == stableFingerprint(&entry) {
-				entry.SHA256 = prev.SHA256 // unchanged: reuse digest, never open the file
+				// Unchanged: reuse the digest and the STORAGE ENCODING without
+				// opening the file. Dropping the encoding here would make the
+				// next manifest claim a raw payload for a compressed blob, and
+				// restore would then look up a key that does not exist.
+				entry.SHA256 = prev.SHA256
+				entry.Encoding = prev.Encoding
 				entries = append(entries, entry)
 				return nil
 			}

@@ -326,3 +326,48 @@ func TestGCWorksWithoutListPermission(t *testing.T) {
 		t.Fatalf("restore after list-free GC: %v", err)
 	}
 }
+
+// TestCompressedBlobSurvivesGenerations is the regression test for a bug the
+// cluster caught: an unchanged file is inherited across generations, and the
+// inheritance path copied only the digest — so the next manifest claimed a raw
+// payload for a blob stored as "<sha>.zstd" and restore failed with
+// "object not found".
+func TestCompressedBlobSurvivesGenerations(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemStore(0)
+	target := mustTarget(t)
+	root := t.TempDir()
+
+	body := strings.Repeat("compress me please\n", 6000) // ~108 KiB, in window
+	writeFile(t, filepath.Join(root, "text.log"), body, 0o644)
+	writeFile(t, filepath.Join(root, "churn.txt"), "v1", 0o644)
+
+	syncer := &Syncer{Store: store}
+	if _, err := syncer.Sync(ctx, SyncOptions{Roots: []string{root}, Target: target, Compress: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Second generation: text.log unchanged (inherited), only churn.txt changes.
+	time.Sleep(2 * time.Millisecond)
+	writeFile(t, filepath.Join(root, "churn.txt"), "v2", 0o644)
+	if _, err := syncer.Sync(ctx, SyncOptions{Roots: []string{root}, Target: target, Compress: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, err := ReadManifest(ctx, store, target, 2, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range manifest.Files {
+		if filepath.Base(f.Path) == "text.log" && f.Encoding != EncodingZstd {
+			t.Fatalf("inherited entry lost its encoding: %+v", f)
+		}
+	}
+
+	// The generation that inherits the compressed entry must restore.
+	want := snapshotTree(t, root)
+	wipeTree(t, root)
+	if _, err := Restore(ctx, store, RestoreOptions{Target: target, Roots: []string{root}}); err != nil {
+		t.Fatalf("restore of the inheriting generation failed: %v", err)
+	}
+	compareTrees(t, want, snapshotTree(t, root))
+}
