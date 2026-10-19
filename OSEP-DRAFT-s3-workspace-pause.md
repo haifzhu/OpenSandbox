@@ -92,6 +92,20 @@ execd 是唯一保证运行在沙箱容器内、具备文件访问能力、且�
 镜像 `injectQEMURestore` 的现成模式(`batchsandbox_pause_resume.go:634,700-706`):同步路径注入共享卷 + init 容器拉回。与 rootfs 路径的本质区别:**不替换主容器镜像**(始终用原基础镜像,镜像尺寸恒定)。
 创建期一致性:server 对配置了本 pausePolicy 的沙箱,在 **create 时就注入相同的卷布局**(同步路径从第一刻起就是卷挂载),避免"首次 pause 前数据在可写层、之后在卷上"的迁移期错配。
 
+**D4b create 注入:restore 在创建路径上也跑,且不判断"有没有数据"**
+
+D4 只覆盖 resume。create 路径原来完全不注入 —— 这个缺口在 `sandboxKey` 出现后从"数据变成孤儿"升级为"数据被覆盖":重建的沙箱以空工作区启动,它第一次 pause 拿空 manifest 去覆盖该前缀的 LATEST(实测:gen 1 含文件、gen 2 零条目)。所以创建路径也注入 restore init 容器,输入取自 server 盖在 pod template 上的同一份契约,`--generation 0`(= LATEST)。
+
+**关键决策:无条件注入,不在控制面探测"这个 target 有没有数据"。** 是否有数据是 target 的属性,只有对象存储知道,而且只在恢复那一刻知道;提前探测是带 TOCTOU 窗口的缓存猜测(探测说空 → 并发 pause 提交了一代 → 恢复被跳过 → 下一次 pause 把那代覆盖掉)。代价是首次孵化的沙箱多跑一个 init 容器、多发一次 Get。
+
+为此 `Restore` 在 LATEST 不存在时**不再报错**(返回 nil,调用方视为"无物可恢复"),否则**每个首次孵化的沙箱都会因 init 容器失败而起不来**;真实的读失败仍然报错 —— 两者混同要么让首次启动全挂,要么静默跳过真正的恢复。
+
+两处与 resume 路径刻意不同:
+- create 路径**仅在 init 容器缺失时安装**。resume 是有意 replace-in-place(必须重新钉到自己那一代的代际),覆盖它会静默改变被唤醒沙箱恢复的是哪一代。
+- 注入改的是**内存里的 pod template**(`scaleBatchSandbox` 与 `recoverStuckPods` 读的是同一个对象),**不 patch CR** —— 覆盖 reconcile 里全部 pod 创建路径,同时不让 CR 与 server 盖的内容漂移,也不引入每次注入一次 reconcile。
+
+**升级顺序硬约束:execd 必须先于 controller。** controller 先上而 execd 仍是旧的 → 旧 execd 在 LATEST 缺失时报错 → **每台新建沙箱都起不来**。反向(execd 先上)行为完全不变:旧 controller 只在 resume 注入,而 resume 时 LATEST 必然存在。
+
 **D5 失败熔断(生产事故教训;实现形态经集群实测修订)**
 - 同步失败 → 沙箱保持 Running(与 OSEP-0008 建议一致),`SandboxSnapshot.phase=Failed`。
 - 熔断实现在 **server 重试桥**侧(无限重试的真实来源,见 81887bd6 案例):workload 注解 `opensandbox.io/pause-failure-count` 计连续失败,超过 `[pause.s3] max_attempts`(默认 3,**0=无限**)时 pause 请求以 409 拒绝;resume 清零。CRD status 字段与 Event 通道留作后续增强(需要向公共 API 暴露失败历史时再加)。
@@ -117,7 +131,7 @@ execd 是唯一保证运行在沙箱容器内、具备文件访问能力、且�
 ```
 - 未设置 → 行为与现在完全一致(rootfs)。
 - `bucket`/`prefix` 为可选覆盖,必须命中 server 配置的 allowlist(`allowed_buckets`/`allowed_prefixes`),防越权写别的桶/前缀;缺省用部署级默认。
-- `sandboxKey` 为可选,**替换布局末段的 `{key}`**:缺省 = 平台分配的 `sandboxId`;提供时 = 调用方持有的稳定标识。动机是**跨重建的数据延续**——调用方重建沙箱(一次新的 create,因而拿到新的 `sandboxId`)时,只要传同一个 key 就落在同一前缀,resume 读得到前任提交的 LATEST,下一次 pause 的增量差分也接着往下走,不需要迁移任何对象。调用方典型做法是传自己那侧的沙箱身份(如 daemon id)。
+- `sandboxKey` 为可选,**替换布局末段的 `{key}`**:缺省 = 平台分配的 `sandboxId`;提供时 = 调用方持有的稳定标识。动机是**跨重建的数据延续**——调用方重建沙箱(一次新的 create,因而拿到新的 `sandboxId`)时,只要传同一个 key 就落在同一前缀,**创建路径的 restore(D4b)读得到前任提交的 LATEST**,下一次 pause 的增量差分也接着往下走,不需要迁移任何对象。**这条依赖 D4b**:只有 key 而没有 create 路径 restore 的版本(controller/execd 早于 D4b),重建的沙箱会以空工作区启动并把它覆盖掉 —— 比不传 key 更糟,不传时旧前缀只是变成孤儿数据。调用方典型做法是传自己那侧的沙箱身份(如 daemon id)。
   - 校验:`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`——单个 path-safe 段,禁止 `/`、前导点、空白。schema 层与注入层**各校验一次**(注入层是最后一道,因为它才是拼路径的地方;非 Pydantic 的调用方绕不过去)。
   - **per-sandbox 隔离降级为调用方责任**:前缀级的结构性保证不受影响(key 仍是单段、仍拼在 `{prefix}/sandboxes/{ns}/` 之下,写不出前缀),但命名空间内"一个沙箱一个前缀"不再由平台保证——两个沙箱传同一个 key 就共用前缀并互相覆盖。调用方必须保证 key 唯一。
   - **与删除语义的交互(重要)**:删除走 BatchSandbox finalizer,按 `s3-pause-target` **整块 purge 前缀**(§6)。所以共享前缀意味着**删掉任一方会清掉双方的代际**。跨重建延续数据的前提是"前任沙箱没有被删除过"——若前任在重建恢复之前就被删了,purge 已经把前缀清了,重建只能从空开始。这是该字段的适用边界,不是缺陷:它解决的是"实例没了但沙箱没被删"(如换集群)的场景,不是"沙箱被删了还能捞回数据"。
@@ -170,12 +184,13 @@ max_attempts = 3
 - `internal/controller/batchsandbox_pause_resume.go`:
   - pause 熔断:失败计数、超限停摆(§4 D5)。
   - `injectWorkspaceRestore()`:镜像不变;为每个同步路径注入共享卷 + `workspace-restore` init 容器(镜像=sync job image 的 restore 模式,凭证来自 secret env,读注解里的 target/gen)。
+- `internal/controller/batchsandbox_workspacerestore.go` + `batchsandbox_controller.go`:create 路径注入(D4b),`injectWorkspaceRestoreOnCreate()` 只在 init 容器缺失时安装;与 resume 路径共用 `workspaceRestorePlan` 构造器,避免两处容器定义漂移。
 - `internal/snapshot/types.go`:`S3Request` / `S3Result`。
 
 **execd(Go,`components/execd`)**
 - 新增内部 API:`POST /internal/snapshot/sync`(仅监听 pod 网络,幂等,带 generation 栅栏)。
 - 同步引擎(`pkg/objsync/`):算法见附录 A;S3 客户端为 aws-sdk-go-v2 + 自定义 Resolver(endpoint/region/forcePathStyle),multipart 上传。
-- 新增 `restore` 子命令(init 容器入口):拉 manifest → 并发下载 blob → 校验 sha256 → 恢复 mode/owner/symlink → 完成。
+- 新增 `restore` 子命令(init 容器入口):拉 manifest → 并发下载 blob → 校验 sha256 → 恢复 mode/owner/symlink → 完成。**LATEST 不存在时直接成功退出**(首次孵化,无物可恢复)——这是 create 路径无条件注入的前提(D4b)。
 
 **镜像**
 - `s3-workspace-syncer`:内含 execd(sync 触发面)+ restore 入口。无特权要求,`runAsNonRoot` 可行。
