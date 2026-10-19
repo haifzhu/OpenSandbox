@@ -29,6 +29,11 @@ ARG CXXFLAGS=
 ARG CGO_CFLAGS=
 ARG CGO_CXXFLAGS=
 ARG CGO_LDFLAGS=
+# Same knob as kubernetes/Dockerfile: the module proxy has to be overridable,
+# or the image can only be built where proxy.golang.org is reachable (the
+# bpf2go step below fetches a tool module at build time).
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 
 # Prepare local modules to satisfy replace directives.
 COPY components/internal/go.mod components/internal/go.sum ./components/internal/
@@ -113,6 +118,8 @@ ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
 ARG TARGETARCH
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 RUN apt-get update && apt-get install -y --no-install-recommends clang
 WORKDIR /build
 COPY components/internal/go.mod components/internal/go.sum ./components/internal/
