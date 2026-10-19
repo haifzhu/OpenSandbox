@@ -16,6 +16,7 @@ package controller
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -60,6 +61,15 @@ type snapshotSyncRequest struct {
 	// forces raw payloads. Incompressible content always stays raw, so
 	// leaving it unset is the sensible default.
 	Compress *bool `json:"compress,omitempty"`
+	// Credentials for this sync. execd runs as the same uid as the sandbox
+	// workload, so it cannot read the root-only credential projection — and
+	// anything it could read from disk, that workload could read too. The
+	// pause Job (an infra pod that never runs user code) hands them over with
+	// the call instead, so they touch neither the sandbox filesystem nor the
+	// sandbox process environment.
+	AccessKeyID     string `json:"accessKeyId,omitempty"`
+	SecretAccessKey string `json:"secretAccessKey,omitempty"`
+	SessionToken    string `json:"sessionToken,omitempty"`
 }
 
 type snapshotSyncResponse struct {
@@ -105,7 +115,14 @@ func (c *SnapshotController) SyncWorkspace() {
 		return
 	}
 
-	ak, sk, tok := syncCredentials()
+	ak, sk, tok, err := syncCredentials(req)
+	if err != nil {
+		// A silent anonymous fallback here surfaces much later as a 403 from
+		// the object store, which is indistinguishable from a permission
+		// problem on the credentials themselves.
+		c.ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	store := objsync.NewS3Store(objsync.S3Config{
 		Endpoint:       req.Endpoint,
 		Region:         req.Region,
@@ -143,10 +160,19 @@ const StatusClientClosedRequest = 499
 // as root-only files (mode 0400) in the sandbox container.
 const defaultCredsDir = "/opt/opensandbox/creds"
 
-// syncCredentials resolves object-store credentials: the projected root-only
-// credential files first (nothing lands in the process environment), the env
-// fallback second (used by infra containers such as the sync Job).
-func syncCredentials() (accessKey, secretKey, sessionToken string) {
+// syncCredentials resolves object-store credentials, most specific source
+// first: the values carried by the sync call, the projected credential files,
+// then the process environment. The request path is what makes sandbox-local
+// syncs work: execd runs as the sandbox workload's uid, so the root-only
+// projection is unreadable to it, and credentials in its own environment
+// would be readable by user code via /proc.
+func syncCredentials(req snapshotSyncRequest) (accessKey, secretKey, sessionToken string, err error) {
+	if req.AccessKeyID != "" || req.SecretAccessKey != "" {
+		if req.AccessKeyID == "" || req.SecretAccessKey == "" {
+			return "", "", "", errors.New("incomplete object-store credentials in sync request")
+		}
+		return req.AccessKeyID, req.SecretAccessKey, req.SessionToken, nil
+	}
 	dir := os.Getenv("OBJSYNC_CREDS_DIR")
 	if dir == "" {
 		dir = defaultCredsDir
@@ -159,9 +185,14 @@ func syncCredentials() (accessKey, secretKey, sessionToken string) {
 		return strings.TrimSpace(string(data))
 	}
 	if ak := read("accessKeyId"); ak != "" {
-		return ak, read("secretAccessKey"), read("sessionToken")
+		return ak, read("secretAccessKey"), read("sessionToken"), nil
 	}
-	return os.Getenv(envAccessKeyID), os.Getenv(envSecretAccessKey), os.Getenv(envSessionToken)
+	ak := os.Getenv(envAccessKeyID)
+	sk := os.Getenv(envSecretAccessKey)
+	if ak == "" || sk == "" {
+		return "", "", "", fmt.Errorf("no object-store credentials: sync request, %s projection and environment are all empty", defaultCredsDir)
+	}
+	return ak, sk, os.Getenv(envSessionToken), nil
 }
 
 // buildSyncOptions maps the wire request onto engine options. Kept separate

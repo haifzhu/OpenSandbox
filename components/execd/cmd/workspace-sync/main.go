@@ -117,6 +117,16 @@ func run(req syncRequest, timeout time.Duration) error {
 		"region":         req.Region,
 		"forcePathStyle": req.ForcePathStyle,
 	}
+	// execd runs as the sandbox workload's uid and cannot read the root-only
+	// credential projection; this Job is an infra pod that never runs user
+	// code, so hand the credentials over with the call.
+	if ak := os.Getenv("OBJSYNC_ACCESS_KEY_ID"); ak != "" {
+		payload["accessKeyId"] = ak
+		payload["secretAccessKey"] = os.Getenv("OBJSYNC_SECRET_ACCESS_KEY")
+		if tok := os.Getenv("OBJSYNC_SESSION_TOKEN"); tok != "" {
+			payload["sessionToken"] = tok
+		}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
