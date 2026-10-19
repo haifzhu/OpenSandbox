@@ -72,7 +72,7 @@ type QEMUContract struct {
 // S3WorkspaceContract selects the s3-workspace pause provider: the sync Job
 // drives execd inside the sandbox to sync Roots (minus Exclude) into Target.
 type S3WorkspaceContract struct {
-	Target         string   `json:"target"`                   // s3://bucket/prefix/sandboxes/{ns}/{id}
+	Target         string   `json:"target"`                   // s3://bucket/prefix/sandboxes/{ns}/{key}
 	Roots          []string `json:"roots"`                    // absolute container paths
 	Exclude        []string `json:"exclude,omitempty"`        // doublestar patterns
 	Endpoint       string   `json:"endpoint,omitempty"`       // S3-compatible endpoint

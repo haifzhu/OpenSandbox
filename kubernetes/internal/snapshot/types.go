@@ -57,7 +57,7 @@ type Request struct {
 // execd on the source pod and verifies the LATEST pointer afterwards.
 type S3Request struct {
 	Version         string   `json:"version"`
-	TargetURL       string   `json:"targetUrl"`             // s3://bucket/prefix/sandboxes/{ns}/{id}
+	TargetURL       string   `json:"targetUrl"`             // s3://bucket/prefix/sandboxes/{ns}/{key}
 	SourcePodIP     string   `json:"sourcePodIp,omitempty"` // resolved by the controller
 	ExecDPort       int      `json:"execdPort"`             // execd API port on the source pod
 	Roots           []string `json:"roots"`                 // absolute container paths to sync

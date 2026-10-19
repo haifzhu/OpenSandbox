@@ -1,6 +1,7 @@
 # OSEP Draft: S3-Compatible Workspace Pause(基于 S3 协议对象存储的工作区持久化暂停)
 
 > 状态:Draft(未编号)
+> 修订:新增可选字段 `sandboxKey`(替换布局末段、支持跨重建延续数据),并补充其与删除/purge 语义的适用边界(§5)
 > 关联:[issue #1169](https://github.com/opensandbox-group/OpenSandbox/issues/1169)、OSEP-0008(rootfs snapshot)、OSEP-0003(volumes)、OSEP-0015(operatingMode/SnapshotClass,draft)
 > 代码基线:本仓库 master(75f4c267)
 
@@ -64,7 +65,7 @@ Controller: 读 SandboxSnapshot(Format=s3-workspace-v1)
 **对象布局(全部落在前缀之下)**:
 
 ```text
-s3://{bucket}/{prefix}/sandboxes/{namespace}/{sandboxId}/
+s3://{bucket}/{prefix}/sandboxes/{namespace}/{key}/
   ├─ LATEST                      # JSON: {generation, manifestDigest, completedAt}
   ├─ gen/{N}/manifest.json       # 文件清单: path→{sha256,size,mode,uid,gid,mtime,type}
   └─ blobs/{sha256前2位}/{sha256} # 共享内容寻址池(跨代去重,见附录 A)
@@ -109,15 +110,20 @@ execd 是唯一保证运行在沙箱容器内、具备文件访问能力、且�
     "prefix": "tenant-a",
     "credentialsSecretName": "s3-sandbox-creds",
     "excludePatterns": ["**/node_modules/.cache/**"],
-    "retentionGenerations": 3
+    "retentionGenerations": 3,
+    "sandboxKey": "3f2a1b4c-0000-1111-2222-333344445555"
   }
 }
 ```
 - 未设置 → 行为与现在完全一致(rootfs)。
 - `bucket`/`prefix` 为可选覆盖,必须命中 server 配置的 allowlist(`allowed_buckets`/`allowed_prefixes`),防越权写别的桶/前缀;缺省用部署级默认。
+- `sandboxKey` 为可选,**替换布局末段的 `{key}`**:缺省 = 平台分配的 `sandboxId`;提供时 = 调用方持有的稳定标识。动机是**跨重建的数据延续**——调用方重建沙箱(一次新的 create,因而拿到新的 `sandboxId`)时,只要传同一个 key 就落在同一前缀,resume 读得到前任提交的 LATEST,下一次 pause 的增量差分也接着往下走,不需要迁移任何对象。调用方典型做法是传自己那侧的沙箱身份(如 daemon id)。
+  - 校验:`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`——单个 path-safe 段,禁止 `/`、前导点、空白。schema 层与注入层**各校验一次**(注入层是最后一道,因为它才是拼路径的地方;非 Pydantic 的调用方绕不过去)。
+  - **per-sandbox 隔离降级为调用方责任**:前缀级的结构性保证不受影响(key 仍是单段、仍拼在 `{prefix}/sandboxes/{ns}/` 之下,写不出前缀),但命名空间内"一个沙箱一个前缀"不再由平台保证——两个沙箱传同一个 key 就共用前缀并互相覆盖。调用方必须保证 key 唯一。
+  - **与删除语义的交互(重要)**:删除走 BatchSandbox finalizer,按 `s3-pause-target` **整块 purge 前缀**(§6)。所以共享前缀意味着**删掉任一方会清掉双方的代际**。跨重建延续数据的前提是"前任沙箱没有被删除过"——若前任在重建恢复之前就被删了,purge 已经把前缀清了,重建只能从空开始。这是该字段的适用边界,不是缺陷:它解决的是"实例没了但沙箱没被删"(如换集群)的场景,不是"沙箱被删了还能捞回数据"。
 - server 侧翻译为 pod template 注解:
   - `sandbox.opensandbox.io/checkpoint-provider: s3-workspace`
-  - `sandbox.opensandbox.io/s3-pause-paths` / `-target`(完整 `s3://bucket/prefix/sandboxes/{ns}/{id}`)/ `-creds-secret` / `-exclude`(JSON)
+  - `sandbox.opensandbox.io/s3-pause-paths` / `-target`(完整 `s3://bucket/prefix/sandboxes/{ns}/{key}`)/ `-creds-secret` / `-exclude`(JSON)
   - `sandbox.opensandbox.io/execd-port`(sync Job 寻址用)
 
 **SandboxSnapshot CRD**(`sandboxsnapshot_types.go`):
@@ -147,7 +153,7 @@ max_attempts = 3
 **寻址与兼容性规则**:
 - endpoint 缺省 → AWS S3 官方分区寻址;显式 endpoint → 任意 S3 兼容服务(OSS 的 S3 兼容端点、MinIO、Ceph RGW、云上自建)。
 - `force_path_style=true` 时用 `https://{endpoint}/{bucket}/{key}` 路径风格(MinIO 必需);false 时虚拟主机风格。
-- 目标 URL 规范形式:`s3://{bucket}/{prefix}/sandboxes/{namespace}/{sandboxId}`,组件(endpoint/region/path-style/凭证)不进 URL、由注解与配置携带。
+- 目标 URL 规范形式:`s3://{bucket}/{prefix}/sandboxes/{namespace}/{key}`(`{key}` = 请求级 `sandboxKey`,缺省为平台分配的 `sandboxId`),组件(endpoint/region/path-style/凭证)不进 URL、由注解与配置携带。
 - 凭证:Secret 内为 `{accessKey, secretKey, sessionToken?}`;不同后端同一格式。
 
 ## 6. 组件改动清单

@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -50,9 +51,37 @@ DEFAULT_EXECD_PORT = 44772
 
 WORKSPACE_CREDS_KEYS = ("accessKeyId", "secretAccessKey", "sessionToken")
 
+# sandboxKey is the one segment of the target path that a caller controls, so it
+# is validated here as well as in the PausePolicy schema. This is the layer that
+# actually joins the path, and it is the only layer every caller goes through:
+# a policy object built without Pydantic (an internal caller, a test fixture)
+# never met the schema's pattern. Same rule, deliberately duplicated — the
+# schema's copy exists to reject a bad request early with a field-level error,
+# this one to make escaping the prefix structurally impossible.
+SANDBOX_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
 
 class WorkspacePauseError(ValueError):
     """Invalid s3-workspace pause configuration (maps to HTTP 400)."""
+
+
+def _resolve_sandbox_key(pause_policy: "PausePolicy", sandbox_id: str) -> str:
+    """Return the last path segment of the pause target.
+
+    Defaults to the platform-assigned sandbox id; a caller-supplied
+    ``pausePolicy.sandboxKey`` replaces it so that a rebuilt sandbox (a new
+    create, hence a new sandbox id) can land on the prefix its predecessor
+    committed to. See the OSEP's §5 for the motivation and, importantly, its
+    applicability boundary: a shared prefix is also purged as a unit, so this
+    carries data across a REBUILD, not across a delete.
+    """
+    key = getattr(pause_policy, "sandbox_key", None) or sandbox_id
+    if not SANDBOX_KEY_RE.match(key):
+        raise WorkspacePauseError(
+            "pausePolicy.sandboxKey must be a single path-safe segment "
+            "(letters/digits first, then letters/digits/._-, max 128)"
+        )
+    return key
 
 
 def build_workspace_pause_target(
@@ -61,11 +90,15 @@ def build_workspace_pause_target(
     namespace: str,
     sandbox_id: str,
 ) -> str:
-    """Compose the canonical s3://bucket/prefix/sandboxes/{ns}/{id} target.
+    """Compose the canonical s3://bucket/prefix/sandboxes/{ns}/{key} target.
 
     All keys the sync engine can ever address derive from this prefix — the
     structural guarantee that a sandbox cannot read or write outside its own
-    namespace.
+    namespace. Note what that guarantee does and does not cover once a caller
+    supplies ``sandboxKey``: the prefix still holds, but per-sandbox separation
+    inside the namespace becomes the caller's responsibility (two sandboxes
+    sharing a key share a prefix, and the delete path purges a prefix whole).
+    See the OSEP §5 for the field's contract and boundary.
     """
     bucket = getattr(pause_policy, "bucket", None) or _cfg(config, "bucket")
     if not bucket:
@@ -93,7 +126,8 @@ def build_workspace_pause_target(
                 "[pause.s3] allowed_prefixes"
             )
 
-    parts = [p for p in (prefix, "sandboxes", namespace, sandbox_id) if p]
+    key = _resolve_sandbox_key(pause_policy, sandbox_id)
+    parts = [p for p in (prefix, "sandboxes", namespace, key) if p]
     return f"s3://{bucket}/{'/'.join(parts)}"
 
 

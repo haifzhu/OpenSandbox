@@ -83,6 +83,7 @@ def _policy(**overrides) -> SimpleNamespace:
         prefix=None,
         credentials_secret_name=None,
         exclude_patterns=["node_modules"],
+        sandbox_key=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -134,6 +135,81 @@ def test_volume_name_contract_parity(wp):
     vectors = {"/workspace": "ws-c52ddf6553", "/root/.lingma": "ws-27b691f987"}
     for root, want in vectors.items():
         assert wp._workspace_volume_name(root) == want
+
+
+def test_sandbox_key_replaces_sandbox_id_in_target(wp):
+    """A caller-supplied key pins the prefix to an identifier that outlives the
+    sandbox id, so a rebuilt sandbox restores its predecessor's generations
+    instead of starting from an empty prefix."""
+    annotations: dict = {}
+
+    wp.apply_workspace_pause(
+        {"containers": [{"name": "sandbox", "env": []}], "volumes": []},
+        annotations,
+        _policy(sandbox_key="daemon-abc"),
+        _app(_config()),
+        "ns1",
+        "sbx-1",
+    )
+
+    target = annotations[wp.ANNOTATION_S3_PAUSE_TARGET]
+    assert target == "s3://sbx/lingma/prod/sandboxes/ns1/daemon-abc"
+    assert "sbx-1" not in target
+
+
+def test_target_falls_back_to_sandbox_id_without_key(wp):
+    annotations: dict = {}
+
+    wp.apply_workspace_pause(
+        {"containers": [{"name": "sandbox", "env": []}], "volumes": []},
+        annotations,
+        _policy(sandbox_key=None),
+        _app(_config()),
+        "ns1",
+        "sbx-1",
+    )
+
+    assert (
+        annotations[wp.ANNOTATION_S3_PAUSE_TARGET]
+        == "s3://sbx/lingma/prod/sandboxes/ns1/sbx-1"
+    )
+
+
+def test_injector_rejects_an_unsafe_sandbox_key(wp):
+    """The injector re-checks the key even though the PausePolicy schema also
+    does. It is the layer that joins the path, and a policy built without
+    Pydantic (a test fixture, an internal caller) never met the schema — so this
+    is the check that makes escaping the prefix structurally impossible rather
+    than merely discouraged.
+
+    An empty key is not in this list: it is falsy and falls back to the sandbox
+    id, matching how bucket/prefix treat an unset override. (The schema is
+    stricter there and rejects "" outright; the injector being the lenient one
+    is the safe direction.)"""
+    for bad in ("../escape", "a/b", "/absolute", ".hidden", "has space", "x" * 129):
+        with pytest.raises(wp.WorkspacePauseError):
+            wp.apply_workspace_pause(
+                {"containers": [{"name": "sandbox", "env": []}], "volumes": []},
+                {},
+                _policy(sandbox_key=bad),
+                _app(_config()),
+                "ns1",
+                "sbx-1",
+            )
+
+
+def test_injector_validates_the_fallback_sandbox_id_too(wp):
+    """The key defaults to the platform-assigned sandbox id, and that value is
+    not schema-checked either — so the same guard has to cover the fallback."""
+    with pytest.raises(wp.WorkspacePauseError):
+        wp.apply_workspace_pause(
+            {"containers": [{"name": "sandbox", "env": []}], "volumes": []},
+            {},
+            _policy(sandbox_key=None),
+            _app(_config()),
+            "ns1",
+            "../../escape",
+        )
 
 
 def test_bucket_override_requires_nonempty_allowlist(wp):

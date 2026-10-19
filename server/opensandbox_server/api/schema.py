@@ -607,6 +607,20 @@ class PausePolicy(BaseModel):
         description="Committed generations kept per sandbox (cleanup is asynchronous).",
     )
 
+    sandbox_key: Optional[str] = Field(
+        None,
+        alias="sandboxKey",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        description=(
+            "Replaces the platform-assigned sandbox id as the last segment of "
+            "the object-store prefix, so a rebuilt sandbox lands on the prefix "
+            "its predecessor committed to. Defaults to the sandbox id. Must be "
+            "unique per sandbox — a shared key means a shared prefix, and the "
+            "delete path purges a prefix whole. Contract and applicability "
+            "boundary: OSEP 'S3-Compatible Workspace Pause' §5."
+        ),
+    )
+
     @model_validator(mode="after")
     def validate_provider_fields(self) -> "PausePolicy":
         if self.provider == "Rootfs":
@@ -619,6 +633,7 @@ class PausePolicy(BaseModel):
                     ("credentialsSecretName", self.credentials_secret_name),
                     ("excludePatterns", self.exclude_patterns),
                     ("retentionGenerations", self.retention_generations),
+                    ("sandboxKey", self.sandbox_key),
                 )
                 if value is not None
             ]
