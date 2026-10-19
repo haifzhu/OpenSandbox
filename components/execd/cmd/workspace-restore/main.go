@@ -86,6 +86,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "workspace-restore: %v\n", err)
 		os.Exit(1)
 	}
+	// Nothing committed under this target yet: a sandbox on its first boot.
+	// The init container runs on every s3-workspace start (that is how a
+	// rebuilt sandbox finds its predecessor's workspace without anyone having
+	// to decide in advance), so "nothing to restore" must be a success.
+	if manifest == nil {
+		log.Info("workspace-restore: no committed generation at %s; nothing to restore", target)
+		fmt.Printf("workspace-restore: no committed generation at %s; nothing to restore\n", target)
+		return
+	}
 	log.Info("workspace-restore: generation %d, %d files", manifest.Generation, len(manifest.Files))
 	fmt.Printf("workspace-restore: restored generation %d (%d entries)\n", manifest.Generation, len(manifest.Files))
 }

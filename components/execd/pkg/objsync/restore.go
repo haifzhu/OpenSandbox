@@ -47,6 +47,17 @@ type RestoreOptions struct {
 // Restore materializes the latest (or pinned) generation under the roots.
 // Files are downloaded to a sibling temp file, digest-verified, then renamed
 // into place; any mismatch aborts the whole restore.
+//
+// A nil result with a nil error means there was nothing to restore: the target
+// has no committed generation yet. Callers must handle it — it is the normal
+// outcome for a sandbox that has never paused, not a failure. Erroring instead
+// would mean no first-incarnation sandbox could ever start, because the restore
+// init container runs on every s3-workspace sandbox boot.
+//
+// Deciding by the target's contents rather than by a control-plane signal is
+// deliberate: whether there is data to restore is a property of the target,
+// knowable only by the object store and only at the moment of the restore.
+// Probing earlier would be a cached guess with a TOCTOU window.
 func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (result *Manifest, err error) {
 	if len(opts.Roots) == 0 {
 		return nil, errors.New("objsync: no restore roots")
@@ -64,6 +75,14 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (resul
 	if generation == 0 {
 		latest, err := ReadLatest(ctx, store, opts.Target)
 		if err != nil {
+			// No LATEST under this target = nothing has ever been committed
+			// here = a fresh sandbox. Only a genuine read failure is an error:
+			// conflating the two would either break every first boot (if
+			// ErrNotFound errored) or silently skip a real restore (if real
+			// failures no-op'd).
+			if errors.Is(err, ErrNotFound) {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("read LATEST: %w", err)
 		}
 		generation = latest.Generation

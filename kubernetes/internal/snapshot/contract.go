@@ -136,20 +136,24 @@ func ContractFromPod(pod *corev1.Pod) (WorkloadContract, error) {
 	return WorkloadContract{Provider: ProviderQEMU, QEMU: contract}, nil
 }
 
-// s3WorkspaceContractFromPod parses and validates the s3-workspace provider
-// annotations on the sandbox pod template.
-func s3WorkspaceContractFromPod(pod *corev1.Pod) (*S3WorkspaceContract, error) {
+// S3WorkspaceContractFromAnnotations parses and validates the s3-workspace
+// provider annotations.
+//
+// It takes the annotation map rather than a Pod because the create path works
+// from the pod TEMPLATE — the server stamps the contract there before any pod
+// exists — while resume works from a live Pod. Both must parse identically.
+func S3WorkspaceContractFromAnnotations(annotations map[string]string) (*S3WorkspaceContract, error) {
 	contract := &S3WorkspaceContract{
-		Target:         strings.TrimSpace(pod.Annotations[AnnotationS3PauseTarget]),
-		Endpoint:       strings.TrimSpace(pod.Annotations[AnnotationS3PauseEndpoint]),
-		Region:         strings.TrimSpace(pod.Annotations[AnnotationS3PauseRegion]),
-		ForcePathStyle: strings.TrimSpace(pod.Annotations[AnnotationS3PausePathStyle]) == "true",
+		Target:         strings.TrimSpace(annotations[AnnotationS3PauseTarget]),
+		Endpoint:       strings.TrimSpace(annotations[AnnotationS3PauseEndpoint]),
+		Region:         strings.TrimSpace(annotations[AnnotationS3PauseRegion]),
+		ForcePathStyle: strings.TrimSpace(annotations[AnnotationS3PausePathStyle]) == "true",
 	}
 
 	if contract.Target == "" || !strings.HasPrefix(contract.Target, "s3://") {
 		return nil, fmt.Errorf("%s must be an s3:// target for s3-workspace checkpoints", AnnotationS3PauseTarget)
 	}
-	if raw := strings.TrimSpace(pod.Annotations[AnnotationS3PausePaths]); raw != "" {
+	if raw := strings.TrimSpace(annotations[AnnotationS3PausePaths]); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &contract.Roots); err != nil {
 			return nil, fmt.Errorf("%s must be a JSON array of absolute paths: %w", AnnotationS3PausePaths, err)
 		}
@@ -163,14 +167,14 @@ func s3WorkspaceContractFromPod(pod *corev1.Pod) (*S3WorkspaceContract, error) {
 		}
 	}
 
-	if raw := strings.TrimSpace(pod.Annotations[AnnotationS3PauseExclude]); raw != "" {
+	if raw := strings.TrimSpace(annotations[AnnotationS3PauseExclude]); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &contract.Exclude); err != nil {
 			return nil, fmt.Errorf("%s must be a JSON array of patterns: %w", AnnotationS3PauseExclude, err)
 		}
 	}
 
 	port := 0
-	if raw := strings.TrimSpace(pod.Annotations[AnnotationExecDPort]); raw != "" {
+	if raw := strings.TrimSpace(annotations[AnnotationExecDPort]); raw != "" {
 		var err error
 		if port, err = strconv.Atoi(raw); err != nil || port <= 0 || port > 65535 {
 			return nil, fmt.Errorf("%s must be a valid port number", AnnotationExecDPort)
@@ -182,6 +186,11 @@ func s3WorkspaceContractFromPod(pod *corev1.Pod) (*S3WorkspaceContract, error) {
 	contract.ExecDPort = port
 
 	return contract, nil
+}
+
+// s3WorkspaceContractFromPod parses the contract off a live pod.
+func s3WorkspaceContractFromPod(pod *corev1.Pod) (*S3WorkspaceContract, error) {
+	return S3WorkspaceContractFromAnnotations(pod.Annotations)
 }
 
 func containerVolumePaths(pod *corev1.Pod, containerName string) []string {

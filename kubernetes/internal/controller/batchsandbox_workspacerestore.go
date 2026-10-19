@@ -40,15 +40,93 @@ const (
 	envSessionToken    = "OBJSYNC_SESSION_TOKEN"
 )
 
+// workspaceRestorePlan is one resolved restore init container's inputs. It is
+// deliberately independent of where the values came from: a resume reads them
+// from the pause snapshot, a create reads them from the pod template's
+// s3-workspace contract. Both must produce an identical container, so the
+// builder lives here once.
+type workspaceRestorePlan struct {
+	Target         string
+	Roots          []string
+	Generation     uint64 // 0 = LATEST
+	Endpoint       string
+	Region         string
+	ForcePathStyle bool
+	CredsSecret    string
+}
+
+func (p workspaceRestorePlan) container(syncImage string, mounts []corev1.VolumeMount) corev1.Container {
+	c := corev1.Container{
+		Name:            workspaceRestoreInitName,
+		Image:           syncImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/usr/local/bin/workspace-restore"},
+		Args: []string{
+			"--target", p.Target,
+			"--roots", strings.Join(p.Roots, ","),
+			"--generation", fmt.Sprintf("%d", p.Generation),
+			"--endpoint", p.Endpoint,
+			"--region", p.Region,
+		},
+		VolumeMounts: mounts,
+		Env:          workspaceCredsEnv(p.CredsSecret),
+		Resources:    workspaceInfraResources,
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                ptrToInt64(0),
+			RunAsNonRoot:             ptrToBool(false),
+			AllowPrivilegeEscalation: ptrToBool(false),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		},
+	}
+	if p.ForcePathStyle {
+		c.Args = append(c.Args, "--path-style")
+	}
+	return c
+}
+
+// ensureWorkspaceRoots gives every sync root a shared volume and a mount in the
+// main container, and returns the init container's mounts.
+//
+// The create-time template already carries this layout (the server injects it
+// when the sandbox opts into the s3-workspace provider), so this is an
+// idempotent safety net; the operative step is installing the init container.
+func ensureWorkspaceRoots(template *corev1.PodTemplateSpec, roots []string) []corev1.VolumeMount {
+	main := &template.Spec.Containers[0]
+	mounts := make([]corev1.VolumeMount, 0, len(roots))
+	for _, root := range roots {
+		volumeName := workspaceVolumeName(root)
+		ensureWorkspaceVolume(&template.Spec, volumeName)
+		if !containerHasMount(main, root) {
+			main.VolumeMounts = append(main.VolumeMounts, corev1.VolumeMount{Name: volumeName, MountPath: root})
+		}
+		mounts = append(mounts, corev1.VolumeMount{Name: volumeName, MountPath: root})
+	}
+	return mounts
+}
+
+// placeWorkspaceRestoreInit installs the restore init container, replacing an
+// existing one in place.
+//
+// The pod template is persistent across pause/resume cycles, so a restore init
+// injected by a PREVIOUS cycle may already be there — pinned to that cycle's
+// generation. Idempotency here means REPLACE-in-place with the current values;
+// skipping would replay stale generations forever (observed: every resume
+// restored gen 1).
+func placeWorkspaceRestoreInit(template *corev1.PodTemplateSpec, restore corev1.Container, mounts []corev1.VolumeMount) {
+	for i := range template.Spec.InitContainers {
+		if template.Spec.InitContainers[i].Name == workspaceRestoreInitName {
+			restore.VolumeMounts = mergeRestoreMounts(template.Spec.InitContainers[i].VolumeMounts, mounts)
+			template.Spec.InitContainers[i] = restore
+			return
+		}
+	}
+	template.Spec.InitContainers = append(template.Spec.InitContainers, restore)
+}
+
 // injectWorkspaceRestore adapts an s3-workspace-v1 resume: the main container
 // keeps its original base image (no snapshot image swap) and each synced root
 // gets a shared volume plus a workspace-restore init container that pulls the
 // committed generation from object storage before the sandbox starts.
-//
-// The create-time template already carries the workspace volume layout (the
-// server injects it when the sandbox opts into the s3-workspace provider), so
-// volume/mount injection here is an idempotent safety net, and the operative
-// step is appending the restore init container.
 func injectWorkspaceRestore(template *corev1.PodTemplateSpec, snapshot *sandboxv1alpha1.SandboxSnapshot, syncImage string) error {
 	if snapshot.Status.Format != sandboxv1alpha1.SandboxSnapshotFormatS3WorkspaceV1 {
 		return nil
@@ -66,60 +144,75 @@ func injectWorkspaceRestore(template *corev1.PodTemplateSpec, snapshot *sandboxv
 
 	roots := append([]string(nil), ws.Roots...)
 	sort.Strings(roots)
+	mounts := ensureWorkspaceRoots(template, roots)
 
-	main := &template.Spec.Containers[0]
-	var mounts []corev1.VolumeMount
-	for _, root := range roots {
-		volumeName := workspaceVolumeName(root)
-		ensureWorkspaceVolume(&template.Spec, volumeName)
-		if !containerHasMount(main, root) {
-			main.VolumeMounts = append(main.VolumeMounts, corev1.VolumeMount{Name: volumeName, MountPath: root})
-		}
-		mounts = append(mounts, corev1.VolumeMount{Name: volumeName, MountPath: root})
+	plan := workspaceRestorePlan{
+		Target:         ws.Target,
+		Roots:          roots,
+		Generation:     ws.Generation,
+		Endpoint:       ws.Endpoint,
+		Region:         ws.Region,
+		ForcePathStyle: ws.ForcePathStyle,
+		// Credentials prefer the create-time template annotation; the snapshot
+		// status value is the fallback for sandboxes whose template predates
+		// the annotation.
+		CredsSecret: workspaceCredsSecretName(template, ws),
 	}
+	placeWorkspaceRestoreInit(template, plan.container(syncImage, mounts), mounts)
+	return nil
+}
 
-	restore := corev1.Container{
-		Name:            workspaceRestoreInitName,
-		Image:           syncImage,
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"/usr/local/bin/workspace-restore"},
-		Args: []string{
-			"--target", ws.Target,
-			"--roots", strings.Join(roots, ","),
-			"--generation", fmt.Sprintf("%d", ws.Generation),
-			"--endpoint", ws.Endpoint,
-			"--region", ws.Region,
-		},
-		VolumeMounts: mounts,
-		// Credentials prefer the create-time template annotation; the
-		// snapshot status value is the fallback for sandboxes whose template
-		// predates the annotation.
-		Env:       workspaceCredsEnv(workspaceCredsSecretName(template, ws)),
-		Resources: workspaceInfraResources,
-		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:                ptrToInt64(0),
-			RunAsNonRoot:             ptrToBool(false),
-			AllowPrivilegeEscalation: ptrToBool(false),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
+// injectWorkspaceRestoreOnCreate installs the restore init container on a
+// freshly created s3-workspace sandbox, from the contract the server stamped
+// onto the pod template.
+//
+// It runs UNCONDITIONALLY: it does not ask whether the target holds anything.
+// That question is a property of the object store — answerable only there, and
+// only at restore time. A control-plane probe would be a cached guess with a
+// TOCTOU window: probe says "empty", a concurrent pause commits a generation,
+// the restore is skipped, and the sandbox's own next pause then overwrites that
+// generation with an empty one. Restoring against LATEST instead means a
+// rebuilt sandbox picks up its predecessor's workspace with nobody having to
+// decide in advance, and a first-incarnation sandbox pays one object read
+// (the restore no-ops when LATEST is absent).
+//
+// Generation 0 = LATEST: a create has no pause snapshot to pin a generation
+// from, and LATEST is exactly what a rebuilt sandbox should converge on.
+// Unlike the resume path, this one only installs when the container is ABSENT.
+// Resume REPLACES in place on purpose (it must re-pin to its own generation),
+// and clobbering that here would silently change what a resumed sandbox
+// restores. A create is the only case where the container cannot already be
+// there for a reason, so a present one means "somebody already decided".
+func injectWorkspaceRestoreOnCreate(template *corev1.PodTemplateSpec, contract *snapshotcontract.S3WorkspaceContract, syncImage string) error {
+	if contract == nil {
+		return nil
 	}
-	if ws.ForcePathStyle {
-		restore.Args = append(restore.Args, "--path-style")
-	}
-
-	// The pod template is persistent across pause/resume cycles, so a restore
-	// init injected by a PREVIOUS cycle may already be there — pinned to that
-	// cycle's generation. Idempotency here means REPLACE-in-place with the
-	// current snapshot's values; skipping would replay stale generations
-	// forever (observed: every resume restored gen 1).
 	for i := range template.Spec.InitContainers {
 		if template.Spec.InitContainers[i].Name == workspaceRestoreInitName {
-			restore.VolumeMounts = mergeRestoreMounts(template.Spec.InitContainers[i].VolumeMounts, mounts)
-			template.Spec.InitContainers[i] = restore
 			return nil
 		}
 	}
-	template.Spec.InitContainers = append(template.Spec.InitContainers, restore)
+	if len(contract.Roots) == 0 {
+		return fmt.Errorf("s3-workspace contract has no roots")
+	}
+	if len(template.Spec.Containers) == 0 {
+		return fmt.Errorf("workspace restore requires a container in the pod template")
+	}
+
+	roots := append([]string(nil), contract.Roots...)
+	sort.Strings(roots)
+	mounts := ensureWorkspaceRoots(template, roots)
+
+	plan := workspaceRestorePlan{
+		Target:         contract.Target,
+		Roots:          roots,
+		Generation:     0, // LATEST
+		Endpoint:       contract.Endpoint,
+		Region:         contract.Region,
+		ForcePathStyle: contract.ForcePathStyle,
+		CredsSecret:    strings.TrimSpace(template.Annotations[snapshotcontract.AnnotationS3PauseCredsSecret]),
+	}
+	placeWorkspaceRestoreInit(template, plan.container(syncImage, mounts), mounts)
 	return nil
 }
 
@@ -216,4 +309,28 @@ func workspaceCredsEnv(secretName string) []corev1.EnvVar {
 			}},
 		},
 	}
+}
+
+// ensureWorkspaceRestoreForCreate installs the workspace-restore init container
+// on the pod template of an s3-workspace sandbox that is about to have pods
+// created for it.
+//
+// The provider check is the same one the pause path uses, so a sandbox that
+// never opted into s3-workspace is untouched, and a malformed contract fails
+// the reconcile instead of creating a pod whose first pause would overwrite the
+// target's committed generation with an empty one.
+func (r *BatchSandboxReconciler) ensureWorkspaceRestoreForCreate(batchSbx *sandboxv1alpha1.BatchSandbox) error {
+	if batchSbx == nil || batchSbx.Spec.Template == nil {
+		return nil
+	}
+	annotations := batchSbx.Spec.Template.Annotations
+	provider := strings.ToLower(strings.TrimSpace(annotations[snapshotcontract.AnnotationCheckpointProvider]))
+	if !snapshotcontract.IsS3WorkspaceProvider(provider) {
+		return nil
+	}
+	contract, err := snapshotcontract.S3WorkspaceContractFromAnnotations(annotations)
+	if err != nil {
+		return fmt.Errorf("invalid s3-workspace contract on the pod template: %w", err)
+	}
+	return injectWorkspaceRestoreOnCreate(batchSbx.Spec.Template, contract, r.WorkspaceSyncImage)
 }

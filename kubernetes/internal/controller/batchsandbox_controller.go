@@ -229,6 +229,16 @@ func (r *BatchSandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if !poolStrategy.IsPooledMode() &&
 		batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhasePaused &&
 		!hasTerminalPodFailureCondition(batchSbx.Status.Conditions) {
+		// An s3-workspace sandbox must pull its committed workspace back before
+		// the main container starts. Injecting onto the in-memory template —
+		// the same object both calls below read — covers every pod-creation
+		// path in this reconcile (scale, and the replacement of a stuck pod)
+		// without patching the CR: the init container is a property of the pod
+		// being created, and a persisted injection would both drift the CR from
+		// what the server stamped and cost a reconcile per injection.
+		if err := r.ensureWorkspaceRestoreForCreate(batchSbx); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to prepare workspace restore %w", err)
+		}
 		// Bounded replacement of stuck provisioning pods; scale recreates them.
 		r.recoverStuckPods(ctx, batchSbx, pods)
 		err := r.scaleBatchSandbox(ctx, batchSbx, batchSbx.Spec.Template, pods)

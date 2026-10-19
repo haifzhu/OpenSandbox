@@ -285,3 +285,123 @@ func TestWorkspaceInfraContainersDeclareResources(t *testing.T) {
 		t.Fatalf("sync trigger container must declare requests and limits: %+v", sync.Resources)
 	}
 }
+
+// s3WorkspaceContractTemplate is the pod template the server stamps for a
+// sandbox that opted into the s3-workspace provider — the create path's only
+// input.
+func s3WorkspaceContractTemplate() *corev1.PodTemplateSpec {
+	template := baseTemplate()
+	template.Annotations[snapshotcontract.AnnotationCheckpointProvider] = "s3-workspace"
+	template.Annotations[snapshotcontract.AnnotationS3PauseTarget] = "s3://bucket/p/sandboxes/ns/sbx"
+	template.Annotations[snapshotcontract.AnnotationS3PausePaths] = `["/workspace"]`
+	template.Annotations[snapshotcontract.AnnotationS3PauseEndpoint] = "http://minio.svc:9000"
+	template.Annotations[snapshotcontract.AnnotationS3PauseRegion] = "us-east-1"
+	template.Annotations[snapshotcontract.AnnotationS3PausePathStyle] = "true"
+	template.Annotations[snapshotcontract.AnnotationExecDPort] = "44772"
+	return template
+}
+
+func mustContract(t *testing.T, template *corev1.PodTemplateSpec) *snapshotcontract.S3WorkspaceContract {
+	t.Helper()
+	contract, err := snapshotcontract.S3WorkspaceContractFromAnnotations(template.Annotations)
+	if err != nil {
+		t.Fatalf("parse contract: %v", err)
+	}
+	return contract
+}
+
+// TestInjectWorkspaceRestoreOnCreate pins the create-path behaviour: a sandbox
+// being created with the s3-workspace provider gets the restore init container
+// pinned to LATEST (generation 0), so a rebuilt sandbox finds its predecessor's
+// workspace without anyone having to decide in advance that it should.
+func TestInjectWorkspaceRestoreOnCreate(t *testing.T) {
+	template := s3WorkspaceContractTemplate()
+
+	if err := injectWorkspaceRestoreOnCreate(template, mustContract(t, template), "syncer:1"); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+
+	init := findRestoreInit(t, template)
+	if init == nil {
+		t.Fatal("restore init container not injected")
+	}
+	joined := strings.Join(init.Args, " ")
+	for _, want := range []string{
+		"--generation 0", // LATEST, not a pinned generation: a create has no snapshot
+		"--path-style",
+		"--roots /workspace",
+		"--endpoint http://minio.svc:9000",
+		"--region us-east-1",
+		"s3://bucket/p/sandboxes/ns/sbx",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("init args missing %q: %v", want, init.Args)
+		}
+	}
+	if init.Image != "syncer:1" {
+		t.Errorf("init image = %q, want syncer:1", init.Image)
+	}
+	// Same defining property as the resume path: the base image is untouched.
+	if template.Spec.Containers[0].Image != "base:1" {
+		t.Errorf("base image was replaced: %q", template.Spec.Containers[0].Image)
+	}
+	// Credentials come from the create-time annotation, which is all a create has.
+	if len(init.Env) == 0 {
+		t.Error("restore init container has no credential env; the create path must project them from the annotation")
+	}
+	// The sync root got a volume and the main container mounts it.
+	if len(template.Spec.Volumes) != 1 || template.Spec.Volumes[0].Name != workspaceVolumeName("/workspace") {
+		t.Errorf("volumes = %+v, want the /workspace volume", template.Spec.Volumes)
+	}
+	if !containerHasMount(&template.Spec.Containers[0], "/workspace") {
+		t.Error("main container does not mount /workspace; restored data would be invisible to it")
+	}
+}
+
+// TestInjectWorkspaceRestoreOnCreateLeavesAResumePinnedContainerAlone: resume
+// replaces the init container in place on purpose (it must re-pin to its own
+// generation). The create path must not clobber that, or a resumed sandbox
+// would silently restore a different generation than the one it was resumed
+// against.
+func TestInjectWorkspaceRestoreOnCreateLeavesAResumePinnedContainerAlone(t *testing.T) {
+	template := s3WorkspaceContractTemplate()
+	if err := injectWorkspaceRestore(template, s3WorkspaceSnapshot(), "syncer:1"); err != nil {
+		t.Fatalf("resume inject: %v", err)
+	}
+
+	if err := injectWorkspaceRestoreOnCreate(template, mustContract(t, template), "syncer:1"); err != nil {
+		t.Fatalf("create inject: %v", err)
+	}
+
+	init := findRestoreInit(t, template)
+	if init == nil {
+		t.Fatal("restore init container vanished")
+	}
+	if !strings.Contains(strings.Join(init.Args, " "), "--generation 7") {
+		t.Errorf("create-path injection clobbered the resume-pinned generation: %v", init.Args)
+	}
+}
+
+// TestInjectWorkspaceRestoreOnCreateRejectsARootlessContract: a contract that
+// cannot restore must fail the reconcile rather than create a pod whose first
+// pause would overwrite the target's committed generation with an empty one.
+func TestInjectWorkspaceRestoreOnCreateRejectsARootlessContract(t *testing.T) {
+	template := s3WorkspaceContractTemplate()
+	if err := injectWorkspaceRestoreOnCreate(template, &snapshotcontract.S3WorkspaceContract{
+		Target: "s3://bucket/p/sandboxes/ns/sbx",
+	}, "syncer:1"); err == nil {
+		t.Fatal("a contract with no roots should be rejected")
+	}
+}
+
+// TestInjectWorkspaceRestoreOnCreateIgnoresANilContract: a sandbox that never
+// opted in carries no contract, and must be left completely alone.
+func TestInjectWorkspaceRestoreOnCreateIgnoresANilContract(t *testing.T) {
+	template := baseTemplate()
+	if err := injectWorkspaceRestoreOnCreate(template, nil, "syncer:1"); err != nil {
+		t.Fatalf("inject with no contract = %v, want nil", err)
+	}
+	if len(template.Spec.InitContainers) != 0 {
+		t.Errorf("init containers = %+v, want none", template.Spec.InitContainers)
+	}
+}

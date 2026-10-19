@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -592,4 +594,56 @@ func symlinkMtime(t *testing.T, path string) (time.Time, int64, error) {
 		return time.Time{}, 0, err
 	}
 	return fi.ModTime(), fi.ModTime().UnixNano(), nil
+}
+
+// getErrorStore fails every Get with a non-ErrNotFound error, standing in for an
+// auth or network failure against an object store that does exist.
+type getErrorStore struct {
+	*MemStore
+	err error
+}
+
+func (g *getErrorStore) Get(context.Context, string, string, io.Writer) (int64, error) {
+	return 0, g.err
+}
+
+// TestRestoreWithNoCommittedGenerationIsANoOp pins the create-path contract:
+// the restore init container runs on EVERY s3-workspace sandbox boot — that is
+// how a rebuilt sandbox picks up its predecessor's workspace with nobody
+// deciding in advance — so a target that has never been committed to must be a
+// success, not an error. Erroring here would mean no first-incarnation sandbox
+// could ever start.
+func TestRestoreWithNoCommittedGenerationIsANoOp(t *testing.T) {
+	ctx := context.Background()
+
+	manifest, err := Restore(ctx, NewMemStore(0), RestoreOptions{
+		Target: mustTarget(t),
+		Roots:  []string{t.TempDir()},
+	})
+	if err != nil {
+		t.Fatalf("restore against a target with no LATEST = %v, want nil", err)
+	}
+	if manifest != nil {
+		t.Fatalf("manifest = %+v, want nil (nothing to restore)", manifest)
+	}
+}
+
+// TestRestoreStillFailsOnARealReadError is the other half of that contract:
+// only a MISSING target is a no-op. An unreadable one must fail loudly, because
+// treating it as "a fresh sandbox" would let the sandbox's next pause commit an
+// empty generation over real data.
+func TestRestoreStillFailsOnARealReadError(t *testing.T) {
+	ctx := context.Background()
+	store := &getErrorStore{MemStore: NewMemStore(0), err: errors.New("503 from the object store")}
+
+	manifest, err := Restore(ctx, store, RestoreOptions{
+		Target: mustTarget(t),
+		Roots:  []string{t.TempDir()},
+	})
+	if err == nil {
+		t.Fatal("restore against an unreadable target should fail, not silently no-op")
+	}
+	if manifest != nil {
+		t.Fatalf("manifest = %+v, want nil on error", manifest)
+	}
 }
