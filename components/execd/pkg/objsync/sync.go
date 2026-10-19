@@ -247,8 +247,33 @@ func (s *Syncer) uploadBlobs(
 		payload []byte
 	}
 	jobs := make(chan job)
-	errCh := make(chan error, concurrency)
 	var wg sync.WaitGroup
+
+	// The dispatcher and the workers share one cancellation. A worker that
+	// returns on error stops receiving, and jobs is unbuffered: without this
+	// the dispatcher blocks forever on jobs <- and the real object-store
+	// error only surfaces when the caller's deadline cancels ctx. One failure
+	// must stop dispatch and tear the workers down immediately.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		firstErr error
+	)
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+	stopErr := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr
+	}
 
 	workers := concurrency
 	if len(toUpload) < workers {
@@ -260,7 +285,7 @@ func (s *Syncer) uploadBlobs(
 			defer wg.Done()
 			for j := range jobs {
 				if err := s.uploadOne(ctx, opts, j.entry, j.key, j.payload, partSize, bytesUploaded); err != nil {
-					errCh <- err
+					fail(err)
 					return
 				}
 				uploaded.Add(1)
@@ -271,15 +296,18 @@ func (s *Syncer) uploadBlobs(
 
 dispatch:
 	for _, entry := range toUpload {
+		if stopErr() != nil {
+			break
+		}
 		if entry.SHA256 == "" {
-			errCh <- fmt.Errorf("entry %s has no digest", entry.Path)
+			fail(fmt.Errorf("entry %s has no digest", entry.Path))
 			break
 		}
 		// The encoding decision must happen before the existence check: it
 		// determines the blob key.
 		encoding, payload, err := s.preparePayload(entry, opts.Compress)
 		if err != nil {
-			errCh <- err
+			fail(err)
 			break
 		}
 		if encodings != nil {
@@ -303,10 +331,8 @@ dispatch:
 	}
 	close(jobs)
 	wg.Wait()
-	select {
-	case err := <-errCh:
+	if err := stopErr(); err != nil {
 		return fmt.Errorf("upload blobs: %w", err)
-	default:
 	}
 	return ctx.Err()
 }
