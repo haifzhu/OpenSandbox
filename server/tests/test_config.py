@@ -593,7 +593,15 @@ def test_load_config_ignores_legacy_pause_block(tmp_path, monkeypatch):
 
     loaded = config_module.load_config(config_path)
     assert loaded.runtime.type == "kubernetes"
-    assert not hasattr(loaded, "pause")
+    # [pause] is a live block again — but for the s3-workspace backend, under
+    # [pause.s3]. The pre-s3 keys in the legacy block must not be honored: an
+    # operator whose config still names the old rootfs-commit settings has to
+    # get the defaults, not a half-applied mixture.
+    assert loaded.pause.s3.endpoint == ""
+    assert loaded.pause.s3.bucket == ""
+    assert loaded.pause.s3.base_prefix == ""
+    assert loaded.pause.s3.credentials_secret == ""
+    assert loaded.pause.s3.default_paths == ["/workspace"]
 
 
 def test_kubernetes_runtime_fills_missing_block():
