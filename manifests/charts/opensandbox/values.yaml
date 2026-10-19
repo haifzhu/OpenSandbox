@@ -36,6 +36,10 @@ opensandbox-controller:
       snapshotPushSecret: ""
       # -- Secret name injected into resumed sandboxes for pulling snapshot images.
       resumePullSecret: ""
+      # -- Image for s3-workspace pause sync/restore Jobs. Required to pause a
+      # sandbox that requests pausePolicy.provider=S3Workspace; keep it in step
+      # with the server's [runtime] execd_image.
+      workspaceSyncImage: ""
 
 # Server component values
 opensandbox-server:

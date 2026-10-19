@@ -88,7 +88,7 @@ The following table lists the configurable parameters of the chart and their def
 | ingress-gateway.enabled | bool | `false` | Whether the ingress gateway is enabled. |
 | opensandbox-controller.controller.logLevel | string | `"info"` | Controller log level (debug, info, error). |
 | opensandbox-controller.controller.replicaCount | int | `1` | Number of controller replicas. |
-| opensandbox-controller.controller.snapshot | object | `{"commitJobTimeout":"10m","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.1","imageCommitterPodTemplate":{},"imageURITemplate":"","registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":""}` | Pause/Resume snapshot configuration. |
+| opensandbox-controller.controller.snapshot | object | `{"commitJobTimeout":"10m","imageCommitterImage":"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.1","imageCommitterPodTemplate":{},"imageURITemplate":"","registry":"","registryInsecure":false,"resumePullSecret":"","snapshotPushSecret":"","workspaceSyncImage":""}` | Pause/Resume snapshot configuration. |
 | opensandbox-controller.controller.snapshot.commitJobTimeout | string | `"10m"` | Timeout duration for commit jobs. |
 | opensandbox-controller.controller.snapshot.imageCommitterImage | string | `"sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/image-committer:release-1.1.1"` | Image used for commit operations. |
 | opensandbox-controller.controller.snapshot.imageCommitterPodTemplate | object | `{}` | PodTemplateSpec overlay for image-committer commit Job Pods. |
@@ -97,6 +97,7 @@ The following table lists the configurable parameters of the chart and their def
 | opensandbox-controller.controller.snapshot.registryInsecure | bool | `false` | Use insecure registry mode when pushing snapshot images. |
 | opensandbox-controller.controller.snapshot.resumePullSecret | string | `""` | Secret name injected into resumed sandboxes for pulling snapshot images. |
 | opensandbox-controller.controller.snapshot.snapshotPushSecret | string | `""` | Secret name used by commit Jobs to push snapshot images. |
+| opensandbox-controller.controller.snapshot.workspaceSyncImage | string | `""` | Image for s3-workspace pause sync/restore Jobs. Required to pause a sandbox that requests pausePolicy.provider=S3Workspace; keep it in step with the server's [runtime] execd_image. |
 | opensandbox-node-agent.enabled | bool | `false` | Whether the node agent is enabled. |
 | opensandbox-server.server.replicaCount | int | `1` | Number of server replicas. Keep one active server; multi-replica HA is not supported yet. |
 

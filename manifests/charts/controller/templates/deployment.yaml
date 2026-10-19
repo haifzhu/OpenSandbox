@@ -97,6 +97,9 @@ spec:
         {{- if .Values.controller.snapshot.resumePullSecret }}
         - --resume-pull-secret={{ .Values.controller.snapshot.resumePullSecret }}
         {{- end }}
+        {{- if .Values.controller.snapshot.workspaceSyncImage }}
+        - --workspace-sync-image={{ .Values.controller.snapshot.workspaceSyncImage }}
+        {{- end }}
         ports:
         - name: health
           containerPort: {{ .Values.controller.livenessProbe.httpGet.port }}
