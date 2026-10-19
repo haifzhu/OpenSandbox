@@ -79,6 +79,27 @@ RUN CGO_ENABLED=0 GOOS=windows go build ${GOFLAGS} -trimpath -buildvcs=false \
     -o /build/execd.exe ./main.go
 
 # Build static bubblewrap with musl.
+# s3-workspace pause entry points. They ship in THIS image because the
+# controller runs them from it: pause syncs through a Job and resume restores
+# through an init container, both addressed as
+# /usr/local/bin/workspace-{sync,restore} (see
+# kubernetes/internal/controller/sandboxsnapshot_s3workspace.go and
+# batchsandbox_workspacerestore.go). Without them the image is an execd sidecar
+# only, and every sandbox that opts into pausePolicy S3Workspace fails to start.
+RUN CGO_ENABLED=0 go build ${GOFLAGS} -trimpath -buildvcs=false \
+    -ldflags "${LDFLAGS} -buildid= -B none \
+              -X 'github.com/alibaba/opensandbox/internal/version.Version=${VERSION}' \
+              -X 'github.com/alibaba/opensandbox/internal/version.BuildTime=${BUILD_TIME}' \
+              -X 'github.com/alibaba/opensandbox/internal/version.GitCommit=${GIT_COMMIT}'" \
+    -o /build/workspace-sync ./cmd/workspace-sync
+
+RUN CGO_ENABLED=0 go build ${GOFLAGS} -trimpath -buildvcs=false \
+    -ldflags "${LDFLAGS} -buildid= -B none \
+              -X 'github.com/alibaba/opensandbox/internal/version.Version=${VERSION}' \
+              -X 'github.com/alibaba/opensandbox/internal/version.BuildTime=${BUILD_TIME}' \
+              -X 'github.com/alibaba/opensandbox/internal/version.GitCommit=${GIT_COMMIT}'" \
+    -o /build/workspace-restore ./cmd/workspace-restore
+
 FROM alpine:latest AS bwrap-builder
 RUN apk add --no-cache git musl-dev meson ninja gcc libcap-dev libcap-static pkgconfig bash
 COPY components/execd/native/session-gate.c /build/session-gate.c
@@ -157,6 +178,8 @@ COPY --from=bwrap-builder --chown=0:0 /build/opensandbox-launcher /usr/local/lib
 COPY --from=bwrap-builder --chown=0:0 /build/opensandbox-launcher /opt/opensandbox/opensandbox-launcher
 COPY --from=builder /build/execd .
 COPY --from=builder /build/execd.exe ./execd.exe
+COPY --from=builder --chown=0:0 /build/workspace-sync /usr/local/bin/workspace-sync
+COPY --from=builder --chown=0:0 /build/workspace-restore /usr/local/bin/workspace-restore
 COPY --from=builder /build/opensandbox-supervisor ./opensandbox-supervisor
 COPY --from=ebpf-builder /build/execd-ebpf ./execd-ebpf
 COPY components/execd/bootstrap.sh ./bootstrap.sh
@@ -169,6 +192,8 @@ RUN chmod 0755 \
     ./execd.exe \
     ./execd-ebpf \
     ./opensandbox-supervisor \
+    /usr/local/bin/workspace-sync \
+    /usr/local/bin/workspace-restore \
     ./bootstrap.sh \
     ./install.bat \
     /usr/local/bin/bwrap \
