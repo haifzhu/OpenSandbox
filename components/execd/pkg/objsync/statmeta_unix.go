@@ -38,11 +38,12 @@ func fileGroup(fi os.FileInfo) int {
 	return 0
 }
 
-// writeMetadata applies uid/gid ownership from a manifest entry. Restores run
-// as root in the sandbox pod init container; failures to chown on filesystems
-// that do not support it are non-fatal (mode is still applied by the caller).
-func writeMetadata(path string, uid, gid int) {
-	_ = syscall.Chown(path, uid, gid) //nolint:gosec // best-effort ownership restore
+// writeMetadata applies uid/gid ownership from a manifest entry. Callers treat
+// a failure as non-fatal (mode still stands) but report it: a silent EPERM
+// here leaves the restored tree owned by root, and a non-root workload can no
+// longer write its own workspace.
+func writeMetadata(path string, uid, gid int) error {
+	return syscall.Chown(path, uid, gid) //nolint:gosec // ownership restore is the point
 }
 
 // lutimes sets the timestamps of a symbolic link itself (without following

@@ -44,6 +44,12 @@ type RestoreOptions struct {
 	Generation uint64
 }
 
+// chownPath applies one entry's ownership. It is a variable so tests can
+// observe the final ownership pass: applying it before the content is written
+// (or before a parent's children exist) breaks the restore, so the ordering is
+// a correctness requirement rather than an implementation detail.
+var chownPath = writeMetadata
+
 // Restore materializes the latest (or pinned) generation under the roots.
 // Files are downloaded to a sibling temp file, digest-verified, then renamed
 // into place; any mismatch aborts the whole restore.
@@ -107,6 +113,7 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (resul
 	// Directories first (depth order by construction: Walk emits parents
 	// before children and manifest.Sort is path-lexicographic, which for
 	// clean absolute paths still orders parents before their children).
+	// Ownership is deliberately NOT applied here: see the final pass below.
 	for _, entry := range manifest.Files {
 		if entry.Type != TypeDir {
 			continue
@@ -117,7 +124,6 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (resul
 		if err := os.MkdirAll(entry.Path, os.FileMode(entry.Mode)); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", entry.Path, err)
 		}
-		writeMetadata(entry.Path, entry.UID, entry.GID)
 	}
 
 	type item struct {
@@ -177,6 +183,34 @@ dispatch:
 		fmt.Fprintf(os.Stderr, "objsync: restore: directory mtime restore failed for %d entries (idempotency fence degraded): %v\n",
 			len(chtimesFailed), chtimesFailed)
 	}
+
+	// Ownership is applied last, deepest first. Restore runs as root but with
+	// only CAP_CHOWN — no CAP_DAC_OVERRIDE or CAP_FOWNER — so it must still own
+	// every path it writes or whose timestamps it sets. Chowning a directory
+	// during the walk would hand it to the workload uid while the remaining
+	// entries under it still need to be created, and those mkdir/chmod/chtimes
+	// calls would then fail with EPERM. Children sort after their parents, so
+	// walking the sorted manifest backwards applies each child before the
+	// parent that contains it.
+	var chownFailed []string
+	for i := len(manifest.Files) - 1; i >= 0; i-- {
+		entry := manifest.Files[i]
+		if entry.Type == TypeSymlink {
+			// chown(2) follows the link and would retarget the file it points
+			// at; symlink permissions are not enforced on Linux anyway.
+			continue
+		}
+		if err := chownPath(entry.Path, entry.UID, entry.GID); err != nil {
+			chownFailed = append(chownFailed, entry.Path)
+		}
+	}
+	if len(chownFailed) > 0 {
+		// Not fatal (the content is intact and the caller can still chown by
+		// hand), but loud: the usual cause is a missing CAP_CHOWN, and the
+		// symptom is a workload that cannot write its own workspace.
+		fmt.Fprintf(os.Stderr, "objsync: restore: chown failed for %d entries, ownership not restored (workload may be unable to write): %v\n",
+			len(chownFailed), chownFailed)
+	}
 	Global.RecordRestore(time.Since(restoreStart), manifest.Stats.BytesScanned, int64(len(manifest.Files)))
 	return manifest, ctx.Err()
 }
@@ -234,7 +268,6 @@ func restoreEntry(ctx context.Context, store ObjectStore, opts RestoreOptions, g
 	if err := os.Chmod(tmpName, os.FileMode(entry.Mode)); err != nil {
 		return fmt.Errorf("chmod %s: %w", tmpName, err)
 	}
-	writeMetadata(tmpName, entry.UID, entry.GID)
 	if err := os.Chtimes(tmpName, timeOf(entry), timeOf(entry)); err != nil {
 		return fmt.Errorf("chtimes %s: %w", tmpName, err)
 	}

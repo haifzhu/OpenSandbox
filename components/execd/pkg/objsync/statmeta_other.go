@@ -21,8 +21,8 @@ import (
 	"time"
 )
 
-func fileOwner(os.FileInfo) int      { return 0 }
-func fileGroup(os.FileInfo) int      { return 0 }
-func writeMetadata(string, int, int) {}
+func fileOwner(os.FileInfo) int            { return 0 }
+func fileGroup(os.FileInfo) int            { return 0 }
+func writeMetadata(string, int, int) error { return nil }
 
 func lutimes(path string, atime, mtime time.Time) error { return nil }
