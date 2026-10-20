@@ -401,6 +401,56 @@ func TestDispatchPauseResume_Case4_CancelAbortsCommittingPause(t *testing.T) {
 	}
 }
 
+func TestDispatchPauseResume_CommittedPauseIsCompletedNotAborted(t *testing.T) {
+	// The cancel landed after the commit succeeded, and completePause may have
+	// released the pod already. Aborting would leave phase=Succeed with no pod;
+	// completing the pause keeps the state machine on its designed path (the
+	// withdrawn intent becomes a resume on the next reconcile).
+	bs := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-bs",
+			Namespace:  "default",
+			Generation: 3,
+		},
+		Spec: sandboxv1alpha1.BatchSandboxSpec{
+			Pause:    ptr.To(false),
+			Replicas: ptr.To(int32(1)),
+			Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "main", Image: "img"}},
+				},
+			},
+		},
+		Status: sandboxv1alpha1.BatchSandboxStatus{
+			PauseObservedGeneration: 2,
+			Phase:                   sandboxv1alpha1.BatchSandboxPhasePausing,
+		},
+	}
+	snapshot := &sandboxv1alpha1.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-bs-pause",
+			Namespace: "default",
+		},
+		Spec: sandboxv1alpha1.SandboxSnapshotSpec{SandboxName: "test-bs"},
+		Status: sandboxv1alpha1.SandboxSnapshotStatus{
+			Phase: sandboxv1alpha1.SandboxSnapshotPhaseSucceed,
+		},
+	}
+	r := newTestReconciler(bs, snapshot)
+	_, handled, err := r.dispatchPauseResume(context.Background(), bs)
+	require.NoError(t, err)
+	assert.True(t, handled)
+
+	ctx := context.Background()
+	require.NoError(t, r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-bs-pause"}, &sandboxv1alpha1.SandboxSnapshot{}),
+		"a committed snapshot must not be deleted by a late cancel")
+
+	updated := &sandboxv1alpha1.BatchSandbox{}
+	require.NoError(t, r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "test-bs"}, updated))
+	assert.Equal(t, sandboxv1alpha1.BatchSandboxPhasePaused, updated.Status.Phase,
+		"a committed pause completes; the withdrawn intent resumes on the next reconcile")
+}
+
 func TestDispatchPauseResume_Case5_GenEqual_PauseNil(t *testing.T) {
 	// gen == pauseObservedGen, pause == nil → normal flow (handled=false)
 	bs := &sandboxv1alpha1.BatchSandbox{

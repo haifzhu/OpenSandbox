@@ -391,21 +391,32 @@ func (r *BatchSandboxReconciler) syncPauseOrClear(ctx context.Context, bs *sandb
 	// that was never actually paused. No PauseFailed condition: a cancel is
 	// not a failure, and the server counts PauseFailed toward its breaker.
 	if bs.Spec.Pause == nil || !*bs.Spec.Pause {
-		log.Info("Dispatch: pause withdrawn while committing; aborting pause")
 		snapshot := &sandboxv1alpha1.SandboxSnapshot{}
 		name := internalPauseSnapshotName(bs.Name)
-		switch err := r.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: name}, snapshot); {
-		case err == nil:
-			if err := r.Delete(ctx, snapshot); err != nil && !errors.IsNotFound(err) {
+		getErr := r.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: name}, snapshot)
+		if getErr == nil && snapshot.Status.Phase == sandboxv1alpha1.SandboxSnapshotPhaseSucceed {
+			// The commit already finished, and completePause may already have
+			// released the pod (its status write can fail and be retried). Aborting
+			// here would strand the sandbox at Succeed with no pod; let the pause
+			// complete, and the withdrawn intent becomes a resume on the next
+			// reconcile (completePause only ACKs the generation while spec.pause is
+			// still true).
+			log.Info("Dispatch: pause already committed; completing it instead of aborting")
+		} else {
+			log.Info("Dispatch: pause withdrawn while committing; aborting pause")
+			switch {
+			case getErr == nil:
+				if err := r.Delete(ctx, snapshot); err != nil && !errors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+			case !errors.IsNotFound(getErr):
+				return ctrl.Result{}, getErr
+			}
+			if err := r.ackPauseWithPhase(ctx, bs, sandboxv1alpha1.BatchSandboxPhaseSucceed, ""); err != nil {
 				return ctrl.Result{}, err
 			}
-		case !errors.IsNotFound(err):
-			return ctrl.Result{}, err
+			return ctrl.Result{}, nil
 		}
-		if err := r.ackPauseWithPhase(ctx, bs, sandboxv1alpha1.BatchSandboxPhaseSucceed, ""); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
 	}
 
 	snapshot := &sandboxv1alpha1.SandboxSnapshot{}
