@@ -75,7 +75,17 @@ func (p workspaceRestorePlan) container(syncImage string, mounts []corev1.Volume
 			RunAsUser:                ptrToInt64(0),
 			RunAsNonRoot:             ptrToBool(false),
 			AllowPrivilegeEscalation: ptrToBool(false),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			// CAP_CHOWN is required: the manifest carries each entry's original
+			// uid/gid, and restoring them is what keeps the workspace writable
+			// for the sandbox workload. This container runs as root but with
+			// every capability dropped, so without it chown fails with EPERM,
+			// the best-effort restore ignores that, and every restored
+			// directory stays root-owned — a non-root workload then cannot
+			// create files in its own workspace.
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN"},
+			},
 		},
 	}
 	if p.ForcePathStyle {

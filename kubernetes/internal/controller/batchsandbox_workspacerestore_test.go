@@ -286,6 +286,37 @@ func TestWorkspaceInfraContainersDeclareResources(t *testing.T) {
 	}
 }
 
+// TestWorkspaceRestoreKeepsChownCapability pins ownership restoration. The
+// manifest records each entry's uid/gid and workspace-restore chowns to them,
+// but the container drops ALL capabilities: without CAP_CHOWN every chown
+// returns EPERM, the best-effort restore swallows it, and restored directories
+// stay root-owned — a non-root workload then cannot write its own workspace
+// (observed: mkdir .task_roots/.pending-*: permission denied).
+func TestWorkspaceRestoreKeepsChownCapability(t *testing.T) {
+	template := baseTemplate()
+	if err := injectWorkspaceRestore(template, s3WorkspaceSnapshot(), "syncer:1"); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	sc := findRestoreInit(t, template).SecurityContext
+	if sc == nil || sc.Capabilities == nil {
+		t.Fatal("restore init container must declare capabilities")
+	}
+	added := false
+	for _, c := range sc.Capabilities.Add {
+		if c == corev1.Capability("CHOWN") {
+			added = true
+		}
+	}
+	if !added {
+		t.Fatalf("restore init container must add CHOWN, got add=%v", sc.Capabilities.Add)
+	}
+	for _, c := range sc.Capabilities.Drop {
+		if c == corev1.Capability("CHOWN") {
+			t.Fatal("CHOWN must not be both dropped and added")
+		}
+	}
+}
+
 // s3WorkspaceContractTemplate is the pod template the server stamps for a
 // sandbox that opted into the s3-workspace provider — the create path's only
 // input.
