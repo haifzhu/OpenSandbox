@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -64,8 +65,31 @@ type S3Store struct {
 
 // NewS3Store builds a store with sensible production defaults for the
 // embedded HTTP client.
+//
+// Syncs and restores issue one request per file, so the store is
+// request-latency bound on workspaces with thousands of small files. The
+// transport therefore keeps a connection per concurrent worker (the stdlib
+// default of 2 idle connections per host makes workers reconnect constantly),
+// and bounds dial and response-header waits so an unreachable object store
+// fails in seconds instead of hanging until the caller's deadline. The overall
+// Timeout stays 0: a multi-GB body legitimately takes minutes, and every call
+// already carries a context that bounds its lifetime.
 func NewS3Store(cfg S3Config) *S3Store {
-	return &S3Store{cfg: cfg, client: &http.Client{Timeout: 0}} //nolint:gosec // per-request contexts bound the lifetime
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	return &S3Store{cfg: cfg, client: &http.Client{Transport: transport}} //nolint:gosec // per-request contexts bound the lifetime
 }
 
 // resolveHost computes request URL host and object path for bucket/key.

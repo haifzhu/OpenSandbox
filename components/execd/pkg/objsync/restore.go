@@ -38,7 +38,11 @@ type RestoreOptions struct {
 	// entry must fall inside one of them; anything else fails closed — a
 	// manifest must never be able to direct writes at arbitrary paths.
 	Roots []string
-	// Concurrency bounds download workers (default 4).
+	// Concurrency bounds download workers (default 16). Restore is one GET per
+	// file, so throughput on a workspace with thousands of small files is
+	// latency bound; measured on 7.7k files, 4 workers took 22s and 16 took
+	// 14s, with no gain past that. Unlike sync, restore holds no payloads in
+	// memory, so a higher worker count costs no extra memory.
 	Concurrency int
 	// Generation pins a specific generation; 0 means LATEST.
 	Generation uint64
@@ -73,7 +77,7 @@ func Restore(ctx context.Context, store ObjectStore, opts RestoreOptions) (resul
 	defer func() { progressEnd(err) }()
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
-		concurrency = 4
+		concurrency = 16
 	}
 
 	generation := opts.Generation

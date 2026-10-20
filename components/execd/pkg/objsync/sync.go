@@ -86,6 +86,10 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (result *SyncResult
 
 	concurrency := opts.Concurrency
 	if concurrency <= 0 {
+		// Deliberately lower than restore's default: the dispatcher hands
+		// workers in-memory payloads for compressible files (up to 64 MiB
+		// before the gain threshold rejects them), so the worker count bounds
+		// peak memory as well as I/O.
 		concurrency = 4
 	}
 	partSize := opts.PartSize

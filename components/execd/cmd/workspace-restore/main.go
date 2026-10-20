@@ -37,7 +37,7 @@ func main() {
 	endpoint := flag.String("endpoint", "", "S3-compatible endpoint (empty = AWS S3)")
 	region := flag.String("region", "us-east-1", "S3 region")
 	pathStyle := flag.Bool("path-style", false, "force path-style addressing (MinIO/Ceph)")
-	concurrency := flag.Int("concurrency", 4, "download concurrency")
+	concurrency := flag.Int("concurrency", 16, "download concurrency")
 	generation := flag.Uint64("generation", 0, "pin a generation; 0 = LATEST")
 	flag.Parse()
 
