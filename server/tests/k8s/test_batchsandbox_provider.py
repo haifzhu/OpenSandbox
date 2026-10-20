@@ -2541,6 +2541,55 @@ spec:
         call_kwargs = mock_k8s_client.patch_custom_object.call_args.kwargs
         assert call_kwargs["body"] == {"spec": {"pause": True}}
 
+    def test_cancel_pause_clears_intent_while_pausing(self, mock_k8s_client):
+        """A Pausing s3-workspace sandbox aborts via spec.pause=false."""
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "sandbox.opensandbox.io/checkpoint-provider": "s3-workspace"
+                        }
+                    }
+                }
+            },
+            "status": {"phase": "Pausing", "conditions": []},
+        }
+        mock_k8s_client.patch_custom_object.return_value = {}
+
+        provider.cancel_pause_sandbox("test-id", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_called_once()
+        assert mock_k8s_client.patch_custom_object.call_args.kwargs["body"] == {
+            "spec": {"pause": False}
+        }
+
+    def test_cancel_pause_is_a_noop_when_nothing_is_in_flight(self, mock_k8s_client):
+        """Idempotent: the commit may have finished before the cancel lands."""
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "status": {"phase": "Succeed", "conditions": []},
+        }
+
+        provider.cancel_pause_sandbox("test-id", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_not_called()
+
+    def test_cancel_pause_rejects_non_s3_workspace(self, mock_k8s_client):
+        """Rootfs image commits and qemu checkpoints have no rollback."""
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "status": {"phase": "Pausing", "conditions": []},
+        }
+
+        with pytest.raises(NotImplementedError):
+            provider.cancel_pause_sandbox("test-id", "test-ns")
+        mock_k8s_client.patch_custom_object.assert_not_called()
+
     def test_pause_sandbox_running_with_pause_failed_allows_retry(self, mock_k8s_client):
         """Test pause retry performs an internal nil->true double patch."""
         provider = BatchSandboxProvider(mock_k8s_client)

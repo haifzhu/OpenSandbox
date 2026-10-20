@@ -38,6 +38,26 @@ def test_pause_route_calls_service_and_returns_202(
     assert calls == ["sbx-001"]
 
 
+def test_cancel_pause_route_calls_service_and_returns_202(
+    client: TestClient,
+    auth_headers: dict,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    class StubService:
+        @staticmethod
+        def cancel_pause_sandbox(sandbox_id: str) -> None:
+            calls.append(sandbox_id)
+
+    monkeypatch.setattr(lifecycle, "sandbox_service", StubService())
+
+    response = client.post("/v1/sandboxes/sbx-001/pause/cancel", headers=auth_headers)
+
+    assert response.status_code == 202
+    assert calls == ["sbx-001"]
+
+
 def test_resume_route_calls_service_and_returns_202(
     client: TestClient,
     auth_headers: dict,

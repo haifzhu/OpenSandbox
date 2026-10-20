@@ -318,6 +318,45 @@ def pause_sandbox(
 
 
 @router.post(
+    "/sandboxes/{sandbox_id}/pause/cancel",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        202: {"description": "Pause cancellation accepted (or nothing was in flight)"},
+        400: {"model": ErrorResponse, "description": "This sandbox type cannot interrupt a pause"},
+        401: {"model": ErrorResponse, "description": "Authentication credentials are missing or invalid"},
+        403: {"model": ErrorResponse, "description": "The authenticated user lacks permission for this operation"},
+        404: {"model": ErrorResponse, "description": "The requested resource does not exist"},
+        409: {"model": ErrorResponse, "description": "The operation conflicts with the current state"},
+        500: {"model": ErrorResponse, "description": "An unexpected server error occurred"},
+    },
+)
+def cancel_pause_sandbox(
+    sandbox_id: str,
+    x_request_id: Optional[str] = Header(None, alias="X-Request-ID", description="Unique request identifier for tracing"),
+) -> Response:
+    """
+    Abort a pause that has not completed yet.
+
+    While the sandbox is Pausing its pod is still running, so aborting leaves
+    it immediately usable — the workspace is not restored from the object store
+    and nothing is committed. Once the sandbox is Paused this is a no-op: use
+    /resume instead. Idempotent, so callers may retry freely.
+
+    Args:
+        sandbox_id: Unique sandbox identifier
+        x_request_id: Unique request identifier for tracing (optional; server generates if omitted).
+
+    Returns:
+        Response: 202 Accepted
+
+    Raises:
+        HTTPException: If sandbox not found or the sandbox type cannot interrupt a pause
+    """
+    sandbox_service.cancel_pause_sandbox(sandbox_id)
+    return Response(status_code=status.HTTP_202_ACCEPTED)
+
+
+@router.post(
     "/sandboxes/{sandbox_id}/resume",
     status_code=status.HTTP_202_ACCEPTED,
     responses={

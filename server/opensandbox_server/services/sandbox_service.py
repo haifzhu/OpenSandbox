@@ -180,6 +180,20 @@ class SandboxService(ABC):
         """
         pass
 
+    def cancel_pause_sandbox(self, sandbox_id: str) -> None:
+        """
+        Abort a pause that has not completed yet.
+
+        Optional capability: the default rejects it so backends without an
+        interruptible commit keep working. Callers treat it as idempotent —
+        when no pause is in flight it is a no-op.
+
+        Raises:
+            NotImplementedError: If the backend cannot interrupt a pause
+            HTTPException: If sandbox not found
+        """
+        raise NotImplementedError("Cancelling a pause is not supported by this backend")
+
     @abstractmethod
     def resume_sandbox(self, sandbox_id: str) -> None:
         """

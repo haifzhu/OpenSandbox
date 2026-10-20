@@ -102,6 +102,9 @@ class CompositeSandboxService(SandboxService, ExtensionService):
     def pause_sandbox(self, sandbox_id: str) -> None:
         self._backend(sandbox_id).pause_sandbox(sandbox_id)
 
+    def cancel_pause_sandbox(self, sandbox_id: str) -> None:
+        self._backend(sandbox_id).cancel_pause_sandbox(sandbox_id)
+
     def resume_sandbox(self, sandbox_id: str) -> None:
         self._backend(sandbox_id).resume_sandbox(sandbox_id)
 

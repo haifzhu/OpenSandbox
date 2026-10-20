@@ -781,6 +781,38 @@ class BatchSandboxProvider(WorkloadProvider):
             self.patch_workload(sandbox_id, namespace, {"spec": {"pause": True}})
             logger.info(f"Patched BatchSandbox {sandbox_id} spec.pause=true")
 
+    def cancel_pause_sandbox(self, sandbox_id: str, namespace: str) -> None:
+        """Abort an in-flight pause by clearing spec.pause.
+
+        Only meaningful while the workload is Pausing. The controller's pause
+        dispatch sees the withdrawn intent, deletes the commit snapshot (and
+        with it the sync Job) and returns the sandbox to Succeed — the pod was
+        never released during Pausing, so there is nothing to restore.
+
+        Idempotent by design: when the sandbox is not Pausing this is a no-op,
+        because callers poll on their own tick and may race the commit
+        finishing. Only s3-workspace pauses can be interrupted; rootfs image
+        commits and qemu checkpoints have no equivalent rollback.
+        """
+        batchsandbox = self.get_workload(sandbox_id, namespace)
+        if not batchsandbox:
+            raise ValueError(f"Sandbox '{sandbox_id}' not found")
+
+        phase = batchsandbox.get("status", {}).get("phase", "")
+        if phase != "Pausing":
+            logger.info(
+                f"BatchSandbox {sandbox_id} cancel-pause ignored: phase={phase}"
+            )
+            return
+
+        if not self._is_s3_workspace(batchsandbox):
+            raise NotImplementedError(
+                "Only s3-workspace pauses can be cancelled mid-flight"
+            )
+
+        self.patch_workload(sandbox_id, namespace, {"spec": {"pause": False}})
+        logger.info(f"Patched BatchSandbox {sandbox_id} spec.pause=false (cancel)")
+
     _PAUSE_FAILURE_COUNT_ANNOTATION = "opensandbox.io/pause-failure-count"
 
     def _is_s3_workspace(self, batchsandbox: Dict[str, Any]) -> bool:

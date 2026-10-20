@@ -383,6 +383,31 @@ func (r *BatchSandboxReconciler) handleResume(ctx context.Context, bs *sandboxv1
 func (r *BatchSandboxReconciler) syncPauseOrClear(ctx context.Context, bs *sandboxv1alpha1.BatchSandbox) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// Cancel: the pause intent was withdrawn while the commit was still in
+	// flight. Abort instead of waiting for it to finish — the pod never left,
+	// so the sandbox is immediately usable again. Deleting the child snapshot
+	// stops the sync too (the commit Job is its controller-owned child), and
+	// ACKing the generation keeps the resume handler from firing on a sandbox
+	// that was never actually paused. No PauseFailed condition: a cancel is
+	// not a failure, and the server counts PauseFailed toward its breaker.
+	if bs.Spec.Pause == nil || !*bs.Spec.Pause {
+		log.Info("Dispatch: pause withdrawn while committing; aborting pause")
+		snapshot := &sandboxv1alpha1.SandboxSnapshot{}
+		name := internalPauseSnapshotName(bs.Name)
+		switch err := r.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: name}, snapshot); {
+		case err == nil:
+			if err := r.Delete(ctx, snapshot); err != nil && !errors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+		case !errors.IsNotFound(err):
+			return ctrl.Result{}, err
+		}
+		if err := r.ackPauseWithPhase(ctx, bs, sandboxv1alpha1.BatchSandboxPhaseSucceed, ""); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	snapshot := &sandboxv1alpha1.SandboxSnapshot{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: bs.Namespace, Name: internalPauseSnapshotName(bs.Name)}, snapshot)
 	if errors.IsNotFound(err) {

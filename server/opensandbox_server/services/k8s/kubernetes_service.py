@@ -1499,6 +1499,49 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 },
             )
 
+    def cancel_pause_sandbox(self, sandbox_id: str) -> None:
+        try:
+            ns = self._resolve_namespace()
+            if get_current_tenant() is not None:
+                _get_owned_workload_or_404(self.workload_provider, ns, sandbox_id)
+            self.workload_provider.cancel_pause_sandbox(sandbox_id, ns)
+        except HTTPException:
+            raise
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_STATE,
+                    "message": "Cancelling a pause is not supported for this sandbox type",
+                },
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "not found" in msg:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail={
+                        "code": SandboxErrorCodes.K8S_SANDBOX_NOT_FOUND,
+                        "message": msg,
+                    },
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_STATE,
+                    "message": msg,
+                },
+            )
+        except Exception as e:
+            logger.error(f"Failed to cancel pause for sandbox {sandbox_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": f"Failed to cancel pause: {e}",
+                },
+            )
+
     def resume_sandbox(self, sandbox_id: str) -> None:
         try:
             ns = self._resolve_namespace()

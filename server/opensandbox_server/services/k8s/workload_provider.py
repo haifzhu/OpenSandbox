@@ -236,6 +236,17 @@ class WorkloadProvider(ABC):
         """
         raise NotImplementedError("Pause is not supported by this provider")
 
+    def cancel_pause_sandbox(self, sandbox_id: str, namespace: str) -> None:
+        """
+        Abort a pause that is still in flight (workload phase Pausing).
+
+        The pod has not been released yet, so aborting leaves a fully usable
+        sandbox. Callers treat this as idempotent: when no pause is in flight
+        it is a no-op. Raises NotImplementedError if the provider cannot
+        interrupt a commit.
+        """
+        raise NotImplementedError("Cancelling a pause is not supported by this provider")
+
     def resume_sandbox(self, sandbox_id: str, namespace: str) -> None:
         """
         Resume a paused sandbox.
