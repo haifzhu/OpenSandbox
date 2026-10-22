@@ -134,3 +134,15 @@ configToml: |
   [egress]
   image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:release-1.1.1"
   mode = "dns+nft"
+
+# -- Optional: create the object-store credential Secret for the s3-workspace
+# pause backend. The Secret must live in the SANDBOX namespace (default
+# "opensandbox"), not this chart's namespace, because the server projects it
+# into sandbox pods and pause jobs there. Leave create=false to manage it
+# out-of-band; only enable when this values file can safely hold secrets.
+pauseS3Credentials:
+  create: false
+  name: s3ws-oss-creds
+  namespace: opensandbox
+  accessKeyId: ""
+  secretAccessKey: ""
