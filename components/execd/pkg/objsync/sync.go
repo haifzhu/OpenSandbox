@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -140,11 +141,23 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (result *SyncResult
 	var uploaded, bytesUploaded atomic.Int64
 	skipped := atomic.Int64{}
 	encodings := map[string]string{}
-	if err := s.uploadBlobs(ctx, opts, walk.ToUpload, oldHashes, generation, partSize, concurrency, &uploaded, &bytesUploaded, &skipped, encodings); err != nil {
+	// staged holds, per path, the digest/size of the bytes actually uploaded:
+	// a file rewritten between the walk and the upload (a daemon appending to
+	// its log) must be recorded by the content that was stored, or the
+	// manifest points at a blob whose bytes never hash to the entry digest
+	// and every restore of the generation fail-closes.
+	staged := map[string]stagedUpload{}
+	if err := s.uploadBlobs(ctx, opts, walk.ToUpload, oldHashes, generation, partSize, concurrency, &uploaded, &bytesUploaded, &skipped, encodings, staged); err != nil {
 		return nil, err
 	}
-	// Stamp the storage encoding onto the manifest entries.
+	// Stamp the storage encoding and the staged digest/size onto the manifest
+	// entries. Entries not staged (unchanged since the previous generation)
+	// keep the walk values, which the previous manifest already vouched for.
 	for i := range walk.Entries {
+		if st, ok := staged[walk.Entries[i].Path]; ok {
+			walk.Entries[i].SHA256 = st.digest
+			walk.Entries[i].Size = st.size
+		}
 		if enc, ok := encodings[walk.Entries[i].Path]; ok {
 			walk.Entries[i].Encoding = enc
 		}
@@ -231,6 +244,11 @@ func (s *Syncer) Sync(ctx context.Context, opts SyncOptions) (result *SyncResult
 // uploadBlobs uploads the changed blobs that do not already exist remotely.
 // Existence is checked in order of cost: hashes referenced by the previous
 // manifest (in-memory set), then a store HEAD, then upload.
+//
+// staged (like encodings) is an out-param the caller merges into the manifest
+// entries: every entry processed here — uploaded or skipped as already known —
+// is recorded with the digest of the bytes that were (or would have been)
+// stored, which may differ from the walk-time digest for hot files.
 func (s *Syncer) uploadBlobs(
 	ctx context.Context,
 	opts SyncOptions,
@@ -241,14 +259,12 @@ func (s *Syncer) uploadBlobs(
 	concurrency int,
 	uploaded, bytesUploaded, skipped *atomic.Int64,
 	encodings map[string]string,
+	staged map[string]stagedUpload,
 ) error {
 	type job struct {
-		entry    FileEntry
-		key      string
-		encoding string
-		// payload is non-nil when the bytes were prepared in memory
-		// (compressed or small raw); nil means stream from disk.
-		payload []byte
+		entry FileEntry
+		st    stagedUpload
+		key   string
 	}
 	jobs := make(chan job)
 	var wg sync.WaitGroup
@@ -288,12 +304,12 @@ func (s *Syncer) uploadBlobs(
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				if err := s.uploadOne(ctx, opts, j.entry, j.key, j.payload, partSize, bytesUploaded); err != nil {
+				if err := s.uploadOne(ctx, opts, j.entry, j.st, j.key, partSize, bytesUploaded); err != nil {
 					fail(err)
 					return
 				}
 				uploaded.Add(1)
-				progressFile(j.entry.Path, j.entry.Size)
+				progressFile(j.entry.Path, j.st.size)
 			}
 		}()
 	}
@@ -307,28 +323,32 @@ dispatch:
 			fail(fmt.Errorf("entry %s has no digest", entry.Path))
 			break
 		}
-		// The encoding decision must happen before the existence check: it
-		// determines the blob key.
-		encoding, payload, err := s.preparePayload(entry, opts.Compress)
+		// Staging reads the bytes and digests EXACTLY what will be uploaded —
+		// never the walk-time digest — so the blob key and the manifest entry
+		// cannot disagree for a file that changed in between.
+		st, err := s.stagePayload(entry, opts.Compress)
 		if err != nil {
 			fail(err)
 			break
 		}
 		if encodings != nil {
-			encodings[entry.Path] = encoding
+			encodings[entry.Path] = st.encoding
 		}
-		if _, known := oldHashes[entry.SHA256]; known && encoding == "" {
+		if staged != nil {
+			staged[entry.Path] = st
+		}
+		if _, known := oldHashes[st.digest]; known && st.encoding == "" {
 			// A previous generation already stored this content raw.
 			skipped.Add(1)
 			continue
 		}
-		key := opts.Target.blobKeyFor(entry.SHA256, encoding)
+		key := opts.Target.blobKeyFor(st.digest, st.encoding)
 		if _, exists, err := s.Store.Head(ctx, opts.Target.Bucket, key); err == nil && exists {
 			skipped.Add(1)
 			continue
 		}
 		select {
-		case jobs <- job{entry: entry, key: key, encoding: encoding, payload: payload}:
+		case jobs <- job{entry: entry, st: st, key: key}:
 		case <-ctx.Done():
 			break dispatch
 		}
@@ -347,69 +367,124 @@ var zstdEncoder, _ = zstd.NewWriter(nil,
 	zstd.WithEncoderLevel(zstd.SpeedDefault),
 	zstd.WithEncoderConcurrency(1))
 
-// preparePayload decides how a file's bytes are stored. Compressible files in
-// the eligible size window are zstd-compressed in memory when that wins at
-// least compressionGainThreshold; everything else streams from disk unchanged.
-func (s *Syncer) preparePayload(entry FileEntry, compress bool) (string, []byte, error) {
-	if entry.Type != TypeRegular || !compress {
-		return "", nil, nil
-	}
-	if entry.Size < compressMinSize || entry.Size > compressMaxSize {
-		return "", nil, nil
-	}
-	raw, err := os.ReadFile(entry.Path) //nolint:gosec // path comes from our own walk
-	if err != nil {
-		return "", nil, fmt.Errorf("read %s for compression: %w", entry.Path, err)
-	}
-	compressed := zstdEncoder.EncodeAll(raw, nil)
-	if float64(len(compressed)) > float64(len(raw))*compressionGainThreshold {
-		return "", nil, nil // not worth it; stream raw
-	}
-	Global.RecordCompression(int64(len(compressed)), int64(len(raw)))
-	return EncodingZstd, compressed, nil
+// stagedUpload is one entry's upload-ready content: digest and size describe
+// EXACTLY the bytes that will be stored (the raw form for compressed blobs),
+// never an earlier walk-time read. A hot file — a daemon appending to its log
+// several times a second — changes between the walk and the upload; using the
+// stale digest to address the blob commits a generation whose restore
+// fail-closes with "digest mismatch", bricking every later resume of that
+// sandbox.
+type stagedUpload struct {
+	digest   string
+	size     int64 // raw byte size the digest covers
+	encoding string
+	// payload is the stored form when the bytes are held in memory (files up
+	// to compressMaxSize, the same bound the compression path always paid);
+	// nil means stream from disk, re-reading exactly size bytes.
+	payload []byte
 }
 
-func (s *Syncer) uploadOne(ctx context.Context, opts SyncOptions, entry FileEntry, key string, payload []byte, partSize int64, bytesUploaded *atomic.Int64) error {
+// stagePayload reads the entry and returns it together with the digest of
+// exactly those bytes. Files up to compressMaxSize are read whole; larger
+// files are hash-streamed and later uploaded as a bounded prefix — an
+// append-only writer cannot retroactively change the bytes a prefix covers,
+// so the digest stays truthful even while the tail keeps moving.
+func (s *Syncer) stagePayload(entry FileEntry, compress bool) (stagedUpload, error) {
 	switch entry.Type {
 	case TypeSymlink:
-		target, err := os.Readlink(entry.Path)
+		target, err := os.Readlink(entry.Path) //nolint:gosec // path comes from our own walk
 		if err != nil {
-			return fmt.Errorf("readlink %s: %w", entry.Path, err)
+			return stagedUpload{}, fmt.Errorf("readlink %s: %w", entry.Path, err)
 		}
 		body := []byte(target)
-		if err := s.Store.Put(ctx, opts.Target.Bucket, key, bytes.NewReader(body), int64(len(body)), entry.SHA256); err != nil {
-			return fmt.Errorf("put symlink blob %s: %w", entry.Path, err)
-		}
-		bytesUploaded.Add(int64(len(body)))
-		return nil
+		return stagedUpload{digest: sha256Hex(body), size: int64(len(body)), payload: body}, nil
 	case TypeRegular:
-		if payload != nil {
-			// Compressed (or small raw) bytes prepared in memory.
-			if err := s.Store.Put(ctx, opts.Target.Bucket, key, bytes.NewReader(payload), int64(len(payload)), ""); err != nil {
-				return fmt.Errorf("put %s: %w", entry.Path, err)
-			}
-			bytesUploaded.Add(int64(len(payload)))
-			return nil
-		}
-		f, err := os.Open(entry.Path) //nolint:gosec // path comes from our own walk
+		info, err := os.Stat(entry.Path) //nolint:gosec // path comes from our own walk
 		if err != nil {
-			return fmt.Errorf("open %s: %w", entry.Path, err)
+			return stagedUpload{}, fmt.Errorf("stat %s: %w", entry.Path, err)
 		}
-		defer f.Close()
-		if entry.Size < partSize {
-			if err := s.Store.Put(ctx, opts.Target.Bucket, key, f, entry.Size, entry.SHA256); err != nil {
-				return fmt.Errorf("put %s: %w", entry.Path, err)
-			}
-		} else {
-			if err := s.Store.PutMultipart(ctx, opts.Target.Bucket, key, f, entry.Size, partSize); err != nil {
-				return fmt.Errorf("multipart put %s: %w", entry.Path, err)
+		if info.Size() > compressMaxSize {
+			return hashFileCurrent(entry.Path)
+		}
+		raw, err := os.ReadFile(entry.Path) //nolint:gosec // path comes from our own walk
+		if err != nil {
+			return stagedUpload{}, fmt.Errorf("read %s: %w", entry.Path, err)
+		}
+		st := stagedUpload{digest: sha256Hex(raw), size: int64(len(raw)), payload: raw}
+		if compress && st.size >= compressMinSize {
+			if compressed := zstdEncoder.EncodeAll(raw, nil); float64(len(compressed)) <= float64(st.size)*compressionGainThreshold {
+				Global.RecordCompression(int64(len(compressed)), st.size)
+				st.encoding, st.payload = EncodingZstd, compressed
 			}
 		}
-		bytesUploaded.Add(entry.Size)
-		return nil
+		return st, nil
 	default:
-		return fmt.Errorf("cannot upload entry type %q (%s)", entry.Type, entry.Path)
+		return stagedUpload{}, fmt.Errorf("cannot stage entry type %q (%s)", entry.Type, entry.Path)
 	}
+}
+
+// hashFileCurrent stages a file too large to hold in memory: it hashes
+// whatever the file holds right now; the upload re-reads exactly that many
+// bytes, so appends racing the upload only extend a tail the digest never
+// covered.
+func hashFileCurrent(path string) (stagedUpload, error) {
+	f, err := os.Open(path) //nolint:gosec // path comes from our own walk
+	if err != nil {
+		return stagedUpload{}, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return stagedUpload{}, fmt.Errorf("hash %s: %w", path, err)
+	}
+	return stagedUpload{digest: hex.EncodeToString(h.Sum(nil)), size: n}, nil
+}
+
+func (s *Syncer) uploadOne(ctx context.Context, opts SyncOptions, entry FileEntry, st stagedUpload, key string, partSize int64, bytesUploaded *atomic.Int64) error {
+	if st.payload != nil {
+		// Bytes staged in memory: what is uploaded is what was digested.
+		signDigest := ""
+		if st.encoding == "" {
+			signDigest = st.digest
+		}
+		if err := s.Store.Put(ctx, opts.Target.Bucket, key, bytes.NewReader(st.payload), int64(len(st.payload)), signDigest); err != nil {
+			return fmt.Errorf("put %s: %w", entry.Path, err)
+		}
+		bytesUploaded.Add(st.size)
+		return nil
+	}
+
+	// Streamed (files above the in-memory bound): re-read exactly st.size
+	// bytes and verify what left the disk still hashes to the staged digest.
+	f, err := os.Open(entry.Path) //nolint:gosec // path comes from our own walk
+	if err != nil {
+		return fmt.Errorf("open %s: %w", entry.Path, err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	r := io.TeeReader(io.LimitReader(f, st.size), h)
+	if st.size < partSize {
+		if err := s.Store.Put(ctx, opts.Target.Bucket, key, r, st.size, st.digest); err != nil {
+			return fmt.Errorf("put %s: %w", entry.Path, err)
+		}
+	} else {
+		if err := s.Store.PutMultipart(ctx, opts.Target.Bucket, key, r, st.size, partSize); err != nil {
+			return fmt.Errorf("multipart put %s: %w", entry.Path, err)
+		}
+	}
+	if hex.EncodeToString(h.Sum(nil)) != st.digest {
+		// The file was rewritten (not appended) mid-upload, so the blob at
+		// this key does not hold the addressed content. Delete it before
+		// anything can commit a manifest pointing here; the sync errors out
+		// and the next pause retries against the rewritten file.
+		if delErr := s.Store.Delete(ctx, opts.Target.Bucket, key); delErr != nil {
+			return fmt.Errorf("file %s changed while uploading and blob cleanup failed: %w", entry.Path, delErr)
+		}
+		return fmt.Errorf("file %s changed while uploading; discarded blob", entry.Path)
+	}
+	bytesUploaded.Add(st.size)
+	return nil
 }
 
 func (s *Syncer) readLatest(ctx context.Context, target Target) (*Latest, error) {
